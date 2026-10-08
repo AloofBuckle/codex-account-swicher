@@ -1,0 +1,17 @@
+[package]
+name = "cas-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cas"
+path = "src/main.rs"
+
+[dependencies]
+cas-core = { path = "../cas-core" }
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+webbrowser.workspace = true
+unicode-width.workspace = true
