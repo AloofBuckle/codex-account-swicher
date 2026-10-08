@@ -31,6 +31,14 @@ pub struct TokenCounts {
 }
 
 impl TokenCounts {
+    /// All newly processed input, including tokens written to prompt cache.
+    /// This is what the terminal labels "新增输入": total minus cache hits.
+    pub fn new_input_tokens(&self) -> u64 {
+        self.input_tokens.saturating_sub(self.cached_input_tokens)
+    }
+
+    /// Input tokens neither read from nor written into the cache. Used only
+    /// for pricing the three mutually exclusive input categories.
     pub fn fresh_input_tokens(&self) -> u64 {
         self.input_tokens
             .saturating_sub(self.cached_input_tokens)
@@ -110,6 +118,9 @@ pub struct UsageRecord {
     pub response_id: Option<String>,
     pub turn_id: Option<String>,
     pub tokens: TokenCounts,
+    /// True when Codex explicitly recorded the cache-write counter (even 0).
+    /// Missing is different from zero for GPT-5.6+ token pricing.
+    pub cache_write_count_reported: bool,
     /// Number of unique tool calls emitted by this response, when the call
     /// event can be associated with its following token usage record.
     pub tool_calls: usize,
@@ -168,6 +179,7 @@ impl SessionUsage {
 pub struct ModelUsage {
     pub model: String,
     pub responses: usize,
+    pub tool_calls: usize,
     pub tokens: TokenCounts,
 }
 
@@ -432,9 +444,11 @@ pub fn scan_codex_usage_in_range(
                 .or_insert_with(|| ModelUsage {
                     model: record.model.clone(),
                     responses: 0,
+                    tool_calls: 0,
                     tokens: TokenCounts::default(),
                 });
             model.responses += 1;
+            model.tool_calls += record.tool_calls;
             model.tokens.add_assign(&record.tokens);
             let tier = by_tier
                 .entry(record.requested_service_tier.clone())
@@ -521,6 +535,7 @@ fn collect_jsonl_files(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawUsage {
     tokens: TokenCounts,
+    cache_write_count_reported: bool,
     reported_total: Option<u64>,
 }
 
@@ -535,14 +550,16 @@ fn parse_tokens(value: &Value) -> Option<RawUsage> {
         .or_else(|| fields.get("cache_read_input_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_write = match fields.get("cache_write_input_tokens") {
+        Some(value) => Some(value.as_u64()?),
+        None => None,
+    };
     Some(RawUsage {
+        cache_write_count_reported: cache_write.is_some(),
         tokens: TokenCounts {
             input_tokens: input,
             cached_input_tokens: cached,
-            cache_write_input_tokens: fields
-                .get("cache_write_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            cache_write_input_tokens: cache_write.unwrap_or(0),
             output_tokens: output,
             reasoning_output_tokens: fields
                 .get("reasoning_output_tokens")
@@ -726,6 +743,7 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
                         response_id,
                         turn_id,
                         request_context_tokens: Some(usage.tokens.input_tokens),
+                        cache_write_count_reported: usage.cache_write_count_reported,
                         tokens: usage.tokens,
                         tool_calls: 0,
                         tool_call_ids: call_ids,
@@ -807,6 +825,14 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
                         None,
                     )
                 };
+                // Only `last_token_usage` can tell us whether a complete
+                // response explicitly reported the cache-write counter.
+                // Cumulative snapshot deltas are not reliable evidence.
+                let cache_write_count_reported = request_context_tokens.is_some()
+                    && snapshot
+                        .last
+                        .as_ref()
+                        .is_some_and(|last| last.cache_write_count_reported);
                 if let Some(total) = snapshot.total {
                     high_water
                         .get_or_insert_with(TokenCounts::default)
@@ -822,6 +848,7 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
                         response_id: None,
                         turn_id: None,
                         request_context_tokens,
+                        cache_write_count_reported,
                         tokens,
                         tool_calls: 0,
                         tool_call_ids: std::mem::take(&mut pending_tool_calls),
@@ -947,7 +974,7 @@ mod tests {
     fn modern(id: &str, input: u64, cached: u64, output: u64) -> Value {
         json!({"type":"token_usage_record","payload":{
             "thread_id":"thread-1", "turn_id":"turn-1", "response_id":id,
-            "usage":{"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output,"reasoning_output_tokens":5}
+            "usage":{"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":0,"output_tokens":output,"reasoning_output_tokens":5}
         }})
     }
 
@@ -1124,6 +1151,96 @@ mod tests {
         assert_eq!(report.totals.cached_input_tokens, 150);
         assert_eq!(report.totals.output_tokens, 6);
         assert_eq!(report.excluded_outside_range, 1);
+    }
+
+    #[test]
+    fn per_model_tool_counts_and_new_inputs_follow_response_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("per-model-tools.jsonl");
+        let usage_with_writes = |id: &str, input: u64, cached: u64, writes: u64, output: u64| {
+            json!({"type":"token_usage_record","payload":{
+                "thread_id":"one", "turn_id":"turn-one", "response_id":id,
+                "usage":{"input_tokens":input,"cached_input_tokens":cached,
+                    "cache_write_input_tokens":writes,"output_tokens":output}
+            }})
+        };
+        write_lines(
+            &file,
+            &[
+                meta("one"),
+                model("gpt-6-sol"),
+                tool_call("custom_tool_call", "sol-one"),
+                tool_call("function_call", "sol-two"),
+                usage_with_writes("response-sol", 1_000, 300, 100, 100),
+                model("gpt-6.1-sol"),
+                tool_call("custom_tool_call", "new-sol-one"),
+                usage_with_writes("response-new-sol", 2_000, 1_400, 200, 200),
+            ],
+        );
+        let report = scan_codex_usage(&paths(&dir), Some(&file)).unwrap();
+        assert_eq!(report.responses, 2);
+        assert_eq!(report.tool_calls, 3);
+        assert_eq!(report.models.iter().map(|m| m.tool_calls).sum::<usize>(), 3);
+        assert_eq!(report.totals.input_tokens, 3_000);
+        assert_eq!(report.totals.cached_input_tokens, 1_700);
+        assert_eq!(report.totals.cache_write_input_tokens, 300);
+        // Newly processed includes cache writes; for billing only, split
+        // new processing into ordinary input and cache-write buckets.
+        assert_eq!(report.totals.new_input_tokens(), 1_300);
+        assert_eq!(report.totals.fresh_input_tokens(), 1_000);
+        assert_eq!(report.pricing.priced_responses, 2);
+        assert_eq!(report.pricing.cache_write_premium_usd, "0.00015");
+        let first = report
+            .models
+            .iter()
+            .find(|m| m.model == "gpt-6-sol")
+            .unwrap();
+        assert_eq!(first.tool_calls, 2);
+        assert_eq!(first.responses, 1);
+        assert_eq!(first.tokens.new_input_tokens(), 700);
+        assert_eq!(first.tokens.output_tokens, 100);
+        let second = report
+            .models
+            .iter()
+            .find(|m| m.model == "gpt-6.1-sol")
+            .unwrap();
+        assert_eq!(second.tool_calls, 1);
+        assert_eq!(second.tokens.new_input_tokens(), 600);
+        assert_eq!(second.tokens.output_tokens, 200);
+    }
+
+    #[test]
+    fn missing_write_counter_is_unpriced_but_explicit_zero_is_priced() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cache-write-missing.jsonl");
+        write_lines(
+            &file,
+            &[
+                meta("one"),
+                model("gpt-6-sol"),
+                json!({"type":"token_usage_record","payload":{
+                    "thread_id":"one", "response_id":"missing",
+                    "usage":{"input_tokens":1_000,"cached_input_tokens":400,"output_tokens":50}
+                }}),
+                json!({"type":"token_usage_record","payload":{
+                    "thread_id":"one", "response_id":"explicit-zero",
+                    "usage":{"input_tokens":2_000,"cached_input_tokens":1_000,
+                        "cache_write_input_tokens":0,"output_tokens":60}
+                }}),
+            ],
+        );
+        let report = scan_codex_usage(&paths(&dir), Some(&file)).unwrap();
+        assert_eq!(report.responses, 2);
+        assert_eq!(report.pricing.priced_responses, 1);
+        assert_eq!(report.pricing.unpriced_responses, 1);
+        assert_eq!(
+            report.pricing.unpriced[0].reason,
+            "missing_cache_write_counter"
+        );
+        assert!(!report.sessions[0].records[0].cache_write_count_reported);
+        assert!(report.sessions[0].records[0].price.is_none());
+        assert!(report.sessions[0].records[1].cache_write_count_reported);
+        assert!(report.sessions[0].records[1].price.is_some());
     }
 
     #[test]

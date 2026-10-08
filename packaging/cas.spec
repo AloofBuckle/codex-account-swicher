@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           cas
-Version:        0.1.35
+Version:        0.1.36
 Release:        1%{?dist}
 Summary:        ChatGPT account switcher for Codex
 License:        Unlicense
@@ -25,6 +25,13 @@ install -Dpm0644 %{SOURCE1} %{buildroot}%{_licensedir}/%{name}/LICENSE
 %license %{_licensedir}/%{name}/LICENSE
 
 %changelog
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.36-1
+- Display per-model tool-call averages, cache hit rate, and average response output
+- Define new input as total input minus cached reads, including cache writes
+- Account for the published 25% cache-write uplift on GPT-5.6 and later models
+- Distinguish missing cache-write counters from confirmed zero; exclude unsafe estimates
+- Show the already-included cache-write uplift in total and per-model USD prices
+
 * Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.35-1
 - Register only separate CLI names and aliases, never slash-joined commands
 - Add independent usage, cost, price aliases and update help for all command groups

@@ -256,6 +256,9 @@ pub struct ResponsePrice {
     pub price_as_of: String,
     pub long_context_surcharge: bool,
     pub standard_usd: String,
+    /// Already included in standard_usd. This is just the *extra* 25% over
+    /// the regular input price charged for reported cache-write tokens.
+    pub cache_write_premium_usd: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,6 +266,7 @@ pub struct ModelPriceSummary {
     pub model: String,
     pub responses: usize,
     pub standard_usd: String,
+    pub cache_write_premium_usd: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,6 +286,7 @@ pub struct PricingSummary {
     pub long_context_responses: usize,
     /// Total only over priced responses (not the entire archive if unpriced > 0).
     pub standard_usd: String,
+    pub cache_write_premium_usd: String,
     pub models: Vec<ModelPriceSummary>,
     pub unpriced: Vec<UnpricedGroup>,
 }
@@ -296,6 +301,7 @@ impl Default for PricingSummary {
             unpriced_responses: 0,
             long_context_responses: 0,
             standard_usd: "0".to_owned(),
+            cache_write_premium_usd: "0".to_owned(),
             models: Vec::new(),
             unpriced: Vec::new(),
         }
@@ -306,6 +312,7 @@ impl Default for PricingSummary {
 struct Accumulator {
     count: usize,
     standard: u128,
+    cache_write_premium: u128,
 }
 
 /// One pico-USD is exactly 1e-12 dollars; rates expressed as micro-USD/Mtok
@@ -332,6 +339,14 @@ fn standard_pico(record: &UsageRecord, rate: &ModelRate) -> Option<(u128, bool)>
     if cached_input_tokens.saturating_add(*cache_write_input_tokens) > *input_tokens {
         return None;
     }
+    // GPT-5.6+ reports the write counter explicitly, even if it is zero.
+    // Earlier JSONL versions may omit it. A missing value is NOT proof of
+    // zero cache writes, so do not quote a lower-priced guess.
+    if rate.cache_write_micro_usd_per_mtok != rate.input_micro_usd_per_mtok
+        && !record.cache_write_count_reported
+    {
+        return None;
+    }
     if rate.long_context_surcharge && record.request_context_tokens.is_none() {
         // Delta-derived legacy tokens are not proof of the size of one prompt.
         // Do not silently omit a potentially expensive long-context premium.
@@ -353,6 +368,17 @@ fn standard_pico(record: &UsageRecord, rate: &ModelRate) -> Option<(u128, bool)>
     } else {
         Some((input_pico + output_pico, false))
     }
+}
+
+/// Portion of the normal quoted price attributable to the write surcharge,
+/// NOT an additional charge. The long-context premium on input also applies.
+fn cache_write_premium_pico(record: &UsageRecord, rate: &ModelRate, long: bool) -> u128 {
+    let uplift = rate
+        .cache_write_micro_usd_per_mtok
+        .saturating_sub(rate.input_micro_usd_per_mtok);
+    u128::from(record.tokens.cache_write_input_tokens)
+        * u128::from(uplift)
+        * if long { 2 } else { 1 }
 }
 
 pub(crate) fn fill_report_prices(report: &mut UsageReport) {
@@ -377,6 +403,10 @@ pub(crate) fn fill_report_prices(report: &mut UsageReport) {
                     > record.tokens.input_tokens
                 {
                     "invalid_cache_breakdown"
+                } else if rate.cache_write_micro_usd_per_mtok != rate.input_micro_usd_per_mtok
+                    && !record.cache_write_count_reported
+                {
+                    "missing_cache_write_counter"
                 } else {
                     "missing_per_request_input_for_long_context"
                 };
@@ -385,19 +415,23 @@ pub(crate) fn fill_report_prices(report: &mut UsageReport) {
                     .or_default() += 1;
                 continue;
             };
+            let write_premium = cache_write_premium_pico(record, &rate, long);
             record.price = Some(ResponsePrice {
                 price_model_id: rate.canonical_id.to_owned(),
                 price_source_url: rate.source_url.to_owned(),
                 price_as_of: PRICING_AS_OF.to_owned(),
                 long_context_surcharge: long,
                 standard_usd: usd_from_pico(standard),
+                cache_write_premium_usd: usd_from_pico(write_premium),
             });
             total.count += 1;
             total.standard += standard;
+            total.cache_write_premium += write_premium;
             long_context_responses += usize::from(long);
             let model = by_model.entry(record.model.clone()).or_default();
             model.count += 1;
             model.standard += standard;
+            model.cache_write_premium += write_premium;
         }
     }
 
@@ -409,12 +443,14 @@ pub(crate) fn fill_report_prices(report: &mut UsageReport) {
         unpriced_responses: unpriced.values().sum(),
         long_context_responses,
         standard_usd: usd_from_pico(total.standard),
+        cache_write_premium_usd: usd_from_pico(total.cache_write_premium),
         models: by_model
             .into_iter()
             .map(|(model, v)| ModelPriceSummary {
                 model,
                 responses: v.count,
                 standard_usd: usd_from_pico(v.standard),
+                cache_write_premium_usd: usd_from_pico(v.cache_write_premium),
             })
             .collect(),
         unpriced: unpriced
@@ -448,6 +484,7 @@ mod tests {
                 output_tokens: output,
                 reasoning_output_tokens: 0,
             },
+            cache_write_count_reported: true,
             tool_calls: 0,
             tool_call_ids: Vec::new(),
             request_context_tokens: Some(input),
@@ -514,6 +551,62 @@ mod tests {
         // => $0.91 input; $2 output; long premium applies to ALL tokens.
         assert!(long);
         assert_eq!(usd_from_pico(pico), "4.82"); // 0.91*2 + 2*1.5
+        assert_eq!(
+            usd_from_pico(cache_write_premium_pico(
+                &rec,
+                &rate_for_model(&rec.model).unwrap(),
+                long,
+            )),
+            "0.1"
+        ); // 100k cache writes * ($2.5-$2)/M * 2 long context
+    }
+
+    #[test]
+    fn official_cache_write_uplift_is_only_25_percent_including_on_gpt_5_6_sol() {
+        let rec = sample("gpt-5.6-sol", 100_000, 50_000, 20_000, 1_000);
+        let rate = rate_for_model(&rec.model).unwrap();
+        let (total, long) = standard_pico(&rec, &rate).unwrap();
+        assert!(!long);
+        // New uncached: 30k * $4/M = $0.12
+        // Cache read: 50k * $0.4/M = $0.02
+        // Cache written: 20k * $5/M = $0.10 (contains $0.02 uplift)
+        // Output: 1k * $20/M = $0.02.
+        assert_eq!(usd_from_pico(total), "0.26");
+        assert_eq!(
+            usd_from_pico(cache_write_premium_pico(&rec, &rate, long)),
+            "0.02"
+        );
+        for id in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.6-cyber",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+        ] {
+            let rate = rate_for_model(id).unwrap();
+            assert_eq!(
+                rate.cache_write_micro_usd_per_mtok * 4,
+                rate.input_micro_usd_per_mtok * 5,
+                "wrong 25% cache-write uplift for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_cache_write_counter_must_not_be_charged_as_zero_on_new_models() {
+        let mut rec = sample("gpt-6-sol", 1_000, 400, 0, 100);
+        let rate = rate_for_model(&rec.model).unwrap();
+        rec.cache_write_count_reported = false;
+        assert!(standard_pico(&rec, &rate).is_none());
+        rec.cache_write_count_reported = true;
+        assert!(standard_pico(&rec, &rate).is_some());
+
+        let mut old = sample("gpt-5.2", 1_000, 400, 0, 100);
+        old.cache_write_count_reported = false;
+        assert!(standard_pico(&old, &rate_for_model("gpt-5.2").unwrap()).is_some());
     }
 
     #[test]

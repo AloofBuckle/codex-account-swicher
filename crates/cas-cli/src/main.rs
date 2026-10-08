@@ -770,6 +770,72 @@ fn print_local_usage(report: &UsageReport) {
             dim(if chinese { "：" } else { ": " }),
             parts.join(&separator())
         );
+        println!(
+            "    {}{}",
+            label(if chinese {
+                "平均每工具用量："
+            } else {
+                "Average per tool call: "
+            }),
+            [
+                field(
+                    if chinese {
+                        "缓存输入"
+                    } else {
+                        "cached input"
+                    },
+                    &format_average_tokens(item.tokens.cached_input_tokens, item.tool_calls),
+                    Color::Magenta,
+                ),
+                field(
+                    if chinese { "新增输入" } else { "new input" },
+                    &format_average_tokens(item.tokens.new_input_tokens(), item.tool_calls),
+                    Color::Yellow,
+                ),
+                field(
+                    if chinese { "输出" } else { "output" },
+                    &format_average_tokens(item.tokens.output_tokens, item.tool_calls),
+                    Color::White,
+                ),
+                count_field(
+                    if chinese {
+                        "工具调用"
+                    } else {
+                        "tool calls"
+                    },
+                    item.tool_calls,
+                    Color::Green,
+                ),
+            ]
+            .join(&separator())
+        );
+        println!(
+            "    {}",
+            [
+                field(
+                    if chinese {
+                        "缓存命中率"
+                    } else {
+                        "cache hit rate"
+                    },
+                    &format_cache_hit_rate(
+                        item.tokens.cached_input_tokens,
+                        item.tokens.input_tokens,
+                    ),
+                    Color::Green,
+                ),
+                field(
+                    if chinese {
+                        "平均每请求输出"
+                    } else {
+                        "average response output"
+                    },
+                    &format_average_tokens(item.tokens.output_tokens, item.responses),
+                    Color::Green,
+                ),
+            ]
+            .join(&separator())
+        );
     }
     println!("{}", label(if chinese { "总计：" } else { "Totals:" }));
     println!(
@@ -782,7 +848,7 @@ fn print_local_usage(report: &UsageReport) {
             ),
             count_field(
                 if chinese { "新增" } else { "fresh" },
-                counts.fresh_input_tokens(),
+                counts.new_input_tokens(),
                 Color::Yellow
             ),
             count_field(
@@ -853,9 +919,9 @@ fn print_local_usage(report: &UsageReport) {
                 Color::Magenta,
             ),
             field(
-                if chinese { "输入" } else { "input" },
-                &format_average_tokens(counts.input_tokens, report.tool_calls),
-                Color::White,
+                if chinese { "新增输入" } else { "new input" },
+                &format_average_tokens(counts.new_input_tokens(), report.tool_calls),
+                Color::Yellow,
             ),
             field(
                 if chinese { "输出" } else { "output" },
@@ -938,6 +1004,14 @@ fn print_local_usage(report: &UsageReport) {
                 if chinese { "标准费用" } else { "Standard" },
                 &price.standard_usd
             ),
+            usd_field(
+                if chinese {
+                    "写缓存溢价（已含）"
+                } else {
+                    "cache-write uplift (included)"
+                },
+                &price.cache_write_premium_usd,
+            ),
             field(
                 if chinese {
                     "费率日期"
@@ -984,6 +1058,14 @@ fn print_local_usage(report: &UsageReport) {
                     Color::Green
                 ),
                 usd_field("Standard", &item.standard_usd),
+                usd_field(
+                    if chinese {
+                        "写缓存溢价（已含）"
+                    } else {
+                        "cache-write uplift (included)"
+                    },
+                    &item.cache_write_premium_usd,
+                ),
             ]
             .join(&separator())
         );
