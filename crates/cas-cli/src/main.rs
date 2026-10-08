@@ -75,15 +75,68 @@ fn count_field(label_text: &str, value: impl std::fmt::Display, color: Color) ->
     field(label_text, &value.to_string(), color)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageDisplayMode {
+    /// Human-friendly, rounded Token values (K/M/B/T) by default.
+    Summary,
+    /// Full integer Token values, matching earlier versions of CAS.
+    Detailed,
+}
+
+fn format_compact_value(value: f64) -> String {
+    const UNITS: [(f64, &str); 6] = [
+        (1e18, "E"),
+        (1e15, "P"),
+        (1e12, "T"),
+        (1e9, "B"),
+        (1e6, "M"),
+        (1e3, "K"),
+    ];
+    let mut index = UNITS.iter().position(|(scale, _)| value >= *scale);
+    if let Some(i) = index {
+        // Avoid showing 1000K/1000M when rounding near a suffix boundary.
+        if i > 0 && (value / UNITS[i].0 * 100.0).round() >= 100_000.0 {
+            index = Some(i - 1);
+        }
+    }
+    if let Some(i) = index {
+        let scaled = value / UNITS[i].0;
+        let text = format!("{scaled:.2}");
+        format!(
+            "{}{}",
+            text.trim_end_matches('0').trim_end_matches('.'),
+            UNITS[i].1
+        )
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_token_count(tokens: u64, mode: UsageDisplayMode) -> String {
+    match mode {
+        UsageDisplayMode::Summary => format_compact_value(tokens as f64),
+        UsageDisplayMode::Detailed => tokens.to_string(),
+    }
+}
+
+fn token_field(label_text: &str, tokens: u64, color: Color, mode: UsageDisplayMode) -> String {
+    field(label_text, &format_token_count(tokens, mode), color)
+}
+
 fn usd_field(label_text: &str, usd: &str) -> String {
     field(label_text, &format!("${usd}"), Color::Green)
 }
 
-fn format_average_tokens(tokens: u64, count: usize) -> String {
+fn format_average_tokens(tokens: u64, count: usize, mode: UsageDisplayMode) -> String {
     if count == 0 {
         if zh() { "不可用" } else { "N/A" }.to_owned()
     } else {
-        format!("{:.2}", tokens as f64 / count as f64)
+        let average = tokens as f64 / count as f64;
+        if mode == UsageDisplayMode::Summary && average >= 1_000.0 {
+            format_compact_value(average)
+        } else {
+            format!("{average:.2}")
+        }
     }
 }
 
@@ -143,6 +196,12 @@ enum Command {
         /// Print structured statistics, including per-response data, as JSON.
         #[arg(long)]
         json: bool,
+        /// Compact token numbers and show only aggregate totals (default).
+        #[arg(long, conflicts_with = "detailed")]
+        summary: bool,
+        /// Show exact tokens, per-model breakdowns and scan warnings.
+        #[arg(long)]
+        detailed: bool,
     },
 }
 
@@ -219,6 +278,8 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                 MainAction::Usage => Command::Usage {
                     path: None,
                     json: false,
+                    summary: false,
+                    detailed: false,
                 },
                 MainAction::Help => {
                     print_ui_help(None);
@@ -230,7 +291,13 @@ fn run(cli: Cli) -> cas_core::Result<()> {
 
     // Usage is intentionally self-contained and read-only: do not require an
     // auth.json, create CAS state directories, or contact the Codex service.
-    if let Command::Usage { path, json } = &command {
+    if let Command::Usage {
+        path,
+        json,
+        summary: _,
+        detailed,
+    } = &command
+    {
         let paths = CasPaths::discover()?;
         // Scripts and --json retain the previous noninteractive all-time
         // behavior. On a terminal the selection UI runs before scanning.
@@ -247,7 +314,14 @@ fn run(cli: Cli) -> cas_core::Result<()> {
         if *json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            print_local_usage(&report);
+            print_local_usage(
+                &report,
+                if *detailed {
+                    UsageDisplayMode::Detailed
+                } else {
+                    UsageDisplayMode::Summary
+                },
+            );
         }
         return Ok(());
     }
@@ -610,7 +684,7 @@ impl Command {
     }
 }
 
-fn print_local_usage(report: &UsageReport) {
+fn print_local_usage(report: &UsageReport, mode: UsageDisplayMode) {
     let chinese = zh();
     println!(
         "{}",
@@ -727,147 +801,165 @@ fn print_local_usage(report: &UsageReport) {
         );
         return;
     }
-    println!("{}", label(if chinese { "按模型：" } else { "By model:" }));
-    for item in &report.models {
-        let parts = [
-            count_field(
-                if chinese { "响应" } else { "responses" },
-                item.responses,
-                Color::Green,
-            ),
-            count_field(
-                if chinese { "输入" } else { "input" },
-                item.tokens.input_tokens,
-                Color::White,
-            ),
-            count_field(
-                if chinese {
-                    "缓存读取"
-                } else {
-                    "cache read"
-                },
-                item.tokens.cached_input_tokens,
-                Color::Magenta,
-            ),
-            count_field(
-                if chinese {
-                    "缓存写入"
-                } else {
-                    "cache write"
-                },
-                item.tokens.cache_write_input_tokens,
-                Color::Blue,
-            ),
-            count_field(
-                if chinese { "输出" } else { "output" },
-                item.tokens.output_tokens,
-                Color::White,
-            ),
-        ];
-        println!(
-            "  {}{}{}",
-            paint(&item.model, Color::Magenta),
-            dim(if chinese { "：" } else { ": " }),
-            parts.join(&separator())
-        );
-        println!(
-            "    {}{}",
-            label(if chinese {
-                "平均每工具用量："
-            } else {
-                "Average per tool call: "
-            }),
-            [
-                field(
-                    if chinese {
-                        "缓存输入"
-                    } else {
-                        "cached input"
-                    },
-                    &format_average_tokens(item.tokens.cached_input_tokens, item.tool_calls),
-                    Color::Magenta,
-                ),
-                field(
-                    if chinese { "新增输入" } else { "new input" },
-                    &format_average_tokens(item.tokens.new_input_tokens(), item.tool_calls),
-                    Color::Yellow,
-                ),
-                field(
-                    if chinese { "输出" } else { "output" },
-                    &format_average_tokens(item.tokens.output_tokens, item.tool_calls),
-                    Color::White,
-                ),
+    if mode == UsageDisplayMode::Detailed {
+        println!("{}", label(if chinese { "按模型：" } else { "By model:" }));
+        for item in &report.models {
+            let parts = [
                 count_field(
-                    if chinese {
-                        "工具调用"
-                    } else {
-                        "tool calls"
-                    },
-                    item.tool_calls,
+                    if chinese { "响应" } else { "responses" },
+                    item.responses,
                     Color::Green,
                 ),
-            ]
-            .join(&separator())
-        );
-        println!(
-            "    {}",
-            [
-                field(
+                token_field(
+                    if chinese { "输入" } else { "input" },
+                    item.tokens.input_tokens,
+                    Color::White,
+                    mode,
+                ),
+                token_field(
                     if chinese {
-                        "缓存命中率"
+                        "缓存读取"
                     } else {
-                        "cache hit rate"
+                        "cache read"
                     },
-                    &format_cache_hit_rate(
-                        item.tokens.cached_input_tokens,
-                        item.tokens.input_tokens,
+                    item.tokens.cached_input_tokens,
+                    Color::Magenta,
+                    mode,
+                ),
+                token_field(
+                    if chinese {
+                        "缓存写入"
+                    } else {
+                        "cache write"
+                    },
+                    item.tokens.cache_write_input_tokens,
+                    Color::Blue,
+                    mode,
+                ),
+                token_field(
+                    if chinese { "输出" } else { "output" },
+                    item.tokens.output_tokens,
+                    Color::White,
+                    mode,
+                ),
+            ];
+            println!(
+                "  {}{}{}",
+                paint(&item.model, Color::Magenta),
+                dim(if chinese { "：" } else { ": " }),
+                parts.join(&separator())
+            );
+            println!(
+                "    {}{}",
+                label(if chinese {
+                    "平均每工具用量："
+                } else {
+                    "Average per tool call: "
+                }),
+                [
+                    field(
+                        if chinese {
+                            "缓存输入"
+                        } else {
+                            "cached input"
+                        },
+                        &format_average_tokens(
+                            item.tokens.cached_input_tokens,
+                            item.tool_calls,
+                            mode
+                        ),
+                        Color::Magenta,
                     ),
-                    Color::Green,
-                ),
-                field(
-                    if chinese {
-                        "平均每请求输出"
-                    } else {
-                        "average response output"
-                    },
-                    &format_average_tokens(item.tokens.output_tokens, item.responses),
-                    Color::Green,
-                ),
-            ]
-            .join(&separator())
-        );
+                    field(
+                        if chinese { "新增输入" } else { "new input" },
+                        &format_average_tokens(
+                            item.tokens.new_input_tokens(),
+                            item.tool_calls,
+                            mode
+                        ),
+                        Color::Yellow,
+                    ),
+                    field(
+                        if chinese { "输出" } else { "output" },
+                        &format_average_tokens(item.tokens.output_tokens, item.tool_calls, mode),
+                        Color::White,
+                    ),
+                    count_field(
+                        if chinese {
+                            "工具调用"
+                        } else {
+                            "tool calls"
+                        },
+                        item.tool_calls,
+                        Color::Green,
+                    ),
+                ]
+                .join(&separator())
+            );
+            println!(
+                "    {}",
+                [
+                    field(
+                        if chinese {
+                            "缓存命中率"
+                        } else {
+                            "cache hit rate"
+                        },
+                        &format_cache_hit_rate(
+                            item.tokens.cached_input_tokens,
+                            item.tokens.input_tokens,
+                        ),
+                        Color::Green,
+                    ),
+                    field(
+                        if chinese {
+                            "平均每请求输出"
+                        } else {
+                            "average response output"
+                        },
+                        &format_average_tokens(item.tokens.output_tokens, item.responses, mode),
+                        Color::Green,
+                    ),
+                ]
+                .join(&separator())
+            );
+        }
     }
     println!("{}", label(if chinese { "总计：" } else { "Totals:" }));
     println!(
         "{}",
         [
-            count_field(
+            token_field(
                 if chinese { "输入" } else { "input" },
                 counts.input_tokens,
-                Color::White
+                Color::White,
+                mode,
             ),
-            count_field(
+            token_field(
                 if chinese { "新增" } else { "fresh" },
                 counts.new_input_tokens(),
-                Color::Yellow
+                Color::Yellow,
+                mode,
             ),
-            count_field(
+            token_field(
                 if chinese {
                     "缓存读取"
                 } else {
                     "cache read"
                 },
                 counts.cached_input_tokens,
-                Color::Magenta
+                Color::Magenta,
+                mode,
             ),
-            count_field(
+            token_field(
                 if chinese {
                     "缓存写入"
                 } else {
                     "cache write"
                 },
                 counts.cache_write_input_tokens,
-                Color::Blue
+                Color::Blue,
+                mode,
             ),
         ]
         .join(&separator())
@@ -875,17 +967,19 @@ fn print_local_usage(report: &UsageReport) {
     println!(
         "{}",
         [
-            count_field(
+            token_field(
                 if chinese { "输出" } else { "output" },
                 counts.output_tokens,
-                Color::White
+                Color::White,
+                mode,
             ),
-            count_field(
+            token_field(
                 if chinese { "推理" } else { "reasoning" },
                 counts.reasoning_output_tokens,
-                Color::Magenta
+                Color::Magenta,
+                mode,
             ),
-            count_field("Token", counts.total_tokens(), Color::Green),
+            token_field("Token", counts.total_tokens(), Color::Green, mode),
         ]
         .join(&separator())
     );
@@ -915,17 +1009,17 @@ fn print_local_usage(report: &UsageReport) {
                 } else {
                     "cached input"
                 },
-                &format_average_tokens(counts.cached_input_tokens, report.tool_calls),
+                &format_average_tokens(counts.cached_input_tokens, report.tool_calls, mode),
                 Color::Magenta,
             ),
             field(
                 if chinese { "新增输入" } else { "new input" },
-                &format_average_tokens(counts.new_input_tokens(), report.tool_calls),
+                &format_average_tokens(counts.new_input_tokens(), report.tool_calls, mode),
                 Color::Yellow,
             ),
             field(
                 if chinese { "输出" } else { "output" },
-                &format_average_tokens(counts.output_tokens, report.tool_calls),
+                &format_average_tokens(counts.output_tokens, report.tool_calls, mode),
                 Color::White,
             ),
             count_field(
@@ -948,7 +1042,7 @@ fn print_local_usage(report: &UsageReport) {
             } else {
                 "average response output"
             },
-            &format_average_tokens(counts.output_tokens, report.responses),
+            &format_average_tokens(counts.output_tokens, report.responses, mode),
             Color::Green,
         )
     );
@@ -977,15 +1071,17 @@ fn print_local_usage(report: &UsageReport) {
                 tier.responses,
                 Color::Green,
             ),
-            count_field(
+            token_field(
                 if chinese { "输入" } else { "input" },
                 tier.tokens.input_tokens,
                 Color::White,
+                mode,
             ),
-            count_field(
+            token_field(
                 if chinese { "输出" } else { "output" },
                 tier.tokens.output_tokens,
                 Color::White,
+                mode,
             ),
         ];
         println!(
@@ -1038,37 +1134,39 @@ fn print_local_usage(report: &UsageReport) {
         ]
         .join(&separator())
     );
-    println!(
-        "{}",
-        label(if chinese {
-            "分价："
-        } else {
-            "Price breakdown:"
-        })
-    );
-    for item in &price.models {
+    if mode == UsageDisplayMode::Detailed {
         println!(
-            "  {}{}{}",
-            paint(&item.model, Color::Magenta),
-            dim(if chinese { "：" } else { ": " }),
-            [
-                count_field(
-                    if chinese { "响应" } else { "responses" },
-                    item.responses,
-                    Color::Green
-                ),
-                usd_field("Standard", &item.standard_usd),
-                usd_field(
-                    if chinese {
-                        "写缓存溢价（已含）"
-                    } else {
-                        "cache-write uplift (included)"
-                    },
-                    &item.cache_write_premium_usd,
-                ),
-            ]
-            .join(&separator())
+            "{}",
+            label(if chinese {
+                "分价："
+            } else {
+                "Price breakdown:"
+            })
         );
+        for item in &price.models {
+            println!(
+                "  {}{}{}",
+                paint(&item.model, Color::Magenta),
+                dim(if chinese { "：" } else { ": " }),
+                [
+                    count_field(
+                        if chinese { "响应" } else { "responses" },
+                        item.responses,
+                        Color::Green
+                    ),
+                    usd_field("Standard", &item.standard_usd),
+                    usd_field(
+                        if chinese {
+                            "写缓存溢价（已含）"
+                        } else {
+                            "cache-write uplift (included)"
+                        },
+                        &item.cache_write_premium_usd,
+                    ),
+                ]
+                .join(&separator())
+            );
+        }
     }
     if price.unpriced_responses > 0 {
         eprintln!(
@@ -1084,16 +1182,18 @@ fn print_local_usage(report: &UsageReport) {
                 " (excluded from USD total):"
             })
         );
-        for item in &price.unpriced {
-            eprintln!(
-                "  {}: {} ({})",
-                paint(&item.model, Color::Magenta),
-                paint(item.responses.to_string(), Color::Red),
-                dim(&item.reason)
-            );
+        if mode == UsageDisplayMode::Detailed {
+            for item in &price.unpriced {
+                eprintln!(
+                    "  {}: {} ({})",
+                    paint(&item.model, Color::Magenta),
+                    paint(item.responses.to_string(), Color::Red),
+                    dim(&item.reason)
+                );
+            }
         }
     }
-    if report.warning_count > 0 {
+    if report.warning_count > 0 && mode == UsageDisplayMode::Detailed {
         eprintln!(
             "{}{}:",
             label(if chinese { "警告" } else { "Warnings " }),
@@ -1211,7 +1311,7 @@ fn print_ui_help(target: Option<&str>) {
             "删除一个已保存账号\n\n用法：cas remove [完整邮箱] 或 cas delete [完整邮箱]\n\n参数：\n  [完整邮箱]  完整邮箱地址；同邮箱多个账号ID时进入账号选择器\n\n行为：\n  当前生效 auth 在列表中标为锁定，删除前需再次交互确认。\n  确认后先关闭 Codex 进程，再删除当前 auth.json 及 CAS 中保存的对应账号；其他账号不受影响。\n  非交互终端不允许删除生效账号。\n\n选项：\n  -h, --help  显示帮助"
         ),
         "usage" | "cost" | "price" => println!(
-            "只读统计 Codex 本地 JSONL 用量及 API 等价美元费用\n\n用法：cas usage [路径] [--json]\n      cas cost [路径] [--json]\n      cas price [路径] [--json]\n\n参数：\n  [路径]    可选 JSONL 文件或目录；默认扫描 CODEX_HOME/sessions 与 archived_sessions\n\n交互选择：\n  1d（今天）、24h、3d、7d、1m、all，或手动输入起始和终止日期。\n  手动编辑 yyyy/mm/dd/hh/mm，上下键切换，留空字段按当前时间填充。\n  --json 或重定向输出时不弹出选择页面，默认统计全部。\n\n行为：\n  仅精确匹配 GPT-5.2 至 GPT-6.1 官方模型 ID；支持缓存和长上下文。\n  按官方 2026-10-08 标准价格快照计价，不推断 Fast 实际执行 tier，非 ChatGPT 实际扣费。\n\n选项：\n  --json      输出逐响应 Token、计价和汇总 JSON\n  -h, --help  显示帮助"
+            "只读统计 Codex 本地 JSONL 用量及 API 等价美元费用\n\n用法：cas usage [路径] [--summary|--detailed] [--json]\n      cas cost [路径] [--summary|--detailed] [--json]\n      cas price [路径] [--summary|--detailed] [--json]\n\n参数：\n  [路径]    可选 JSONL 文件或目录；默认扫描 CODEX_HOME/sessions 与 archived_sessions\n\n交互选择：\n  1d（今天）、24h、3d、7d、1m、all，或手动输入起始和终止日期。\n  手动编辑 yyyy/mm/dd/hh/mm，上下键切换，留空字段按当前时间填充。\n  --json 或重定向输出时不弹出选择页面，默认统计全部。\n\n行为：\n  不指定格式时默认 --summary：Token 使用 K/M/B 简写，隐藏按模型用量、模型分价与扫描警告。\n  --detailed：显示原始完整 Token 数量、按模型详情和所有扫描警告。\n  --json：保留全部精确数值及警告，不受显示格式参数影响。\n  仅精确匹配 GPT-5.2 至 GPT-6.1 官方模型 ID；支持缓存和长上下文。\n  按官方 2026-10-08 标准价格快照计价，不推断 Fast 实际执行 tier，非 ChatGPT 实际扣费。\n\n选项：\n  --summary   紧凑显示汇总数据（默认）\n  --detailed  显示完整用量、分价和警告，与 --summary 互斥\n  --json      输出逐响应 Token、计价和汇总 JSON\n  -h, --help  显示帮助"
         ),
         _ => println!(
             "Codex 的 ChatGPT 账号切换器\n\n用法：cas [命令]\n\n命令（每个名字单独使用）：\n  login                登录 ChatGPT 账号\n  status               刷新凭据有效性和 Codex 剩余用量\n  test、refresh         并发测试所有账号的 gpt-6-luna 流式响应\n  switch、enable        结束 Codex 并切换账号\n  import、input         导入 auth.json\n  remove、delete        删除已保存账号\n  usage、cost、price     只读统计本地 JSONL Token 消耗及 API 等价美元价格\n  help                 显示帮助\n\n选项：\n  -h, --help           显示帮助\n  -V, --version        显示版本"
@@ -1956,10 +2056,10 @@ fn print_test_result(result: &cas_core::AccountTestResult) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountSelectionMode, Cli, Command, cycle_selection, format_account_choice,
-        format_account_choice_for_action, format_average_tokens, format_cache_hit_rate,
-        format_current_auth, is_selected_active, menu_rendered_rows, usage_color, visible_width,
-        zh,
+        AccountSelectionMode, Cli, Command, UsageDisplayMode, cycle_selection,
+        format_account_choice, format_account_choice_for_action, format_average_tokens,
+        format_cache_hit_rate, format_compact_value, format_current_auth, format_token_count,
+        is_selected_active, menu_rendered_rows, usage_color, visible_width, zh,
     };
     use cas_core::{
         AccountChoice, AccountRecord, AccountStatusSnapshot, CurrentAccount, UsageWindow,
@@ -2189,12 +2289,64 @@ mod tests {
             let cli =
                 Cli::try_parse_from(["cas", command, "--json", "/tmp/rollout.jsonl"]).unwrap();
             match cli.command {
-                Some(Command::Usage { path, json }) => {
+                Some(Command::Usage {
+                    path,
+                    json,
+                    summary,
+                    detailed,
+                }) => {
                     assert_eq!(path.unwrap(), std::path::Path::new("/tmp/rollout.jsonl"));
                     assert!(json);
+                    assert!(!summary);
+                    assert!(!detailed);
                 }
                 _ => panic!("{command} did not parse as usage"),
             }
+        }
+    }
+
+    #[test]
+    fn usage_display_flags_default_to_summary_and_are_consistent_across_aliases() {
+        for name in ["usage", "cost", "price"] {
+            let parse = |extra: &[&str]| {
+                let mut argv = vec!["cas", name];
+                argv.extend_from_slice(extra);
+                Cli::try_parse_from(argv).unwrap()
+            };
+            assert!(matches!(
+                parse(&[]).command,
+                Some(Command::Usage {
+                    summary: false,
+                    detailed: false,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                parse(&["--summary"]).command,
+                Some(Command::Usage {
+                    summary: true,
+                    detailed: false,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                parse(&["--detailed"]).command,
+                Some(Command::Usage {
+                    summary: false,
+                    detailed: true,
+                    ..
+                })
+            ));
+            // JSON remains complete and machine-readable in either mode.
+            assert!(matches!(
+                parse(&["--json", "--detailed"]).command,
+                Some(Command::Usage {
+                    json: true,
+                    detailed: true,
+                    ..
+                })
+            ));
+            assert!(Cli::try_parse_from(["cas", name, "--summary", "--detailed"]).is_err());
         }
     }
 
@@ -2225,9 +2377,51 @@ mod tests {
     #[test]
     fn averaged_usage_and_cache_rates_handle_zero_and_nonzero_denominators() {
         assert_eq!(format_cache_hit_rate(197_888, 236_437), "83.70%");
-        assert_eq!(format_average_tokens(909, 7), "129.86");
-        assert_eq!(format_average_tokens(100, 4), "25.00");
-        assert!(!format_average_tokens(100, 0).is_empty());
+        assert_eq!(
+            format_average_tokens(909, 7, UsageDisplayMode::Summary),
+            "129.86"
+        );
+        assert_eq!(
+            format_average_tokens(100, 4, UsageDisplayMode::Detailed),
+            "25.00"
+        );
+        assert!(!format_average_tokens(100, 0, UsageDisplayMode::Summary).is_empty());
         assert!(!format_cache_hit_rate(0, 0).is_empty());
+    }
+
+    #[test]
+    fn token_compaction_covers_suffix_boundaries_and_keeps_detailed_exact() {
+        for (tokens, expected) in [
+            (0, "0"),
+            (10, "10"),
+            (999, "999"),
+            (1_000, "1K"),
+            (1_500, "1.5K"),
+            (236_437, "236.44K"),
+            (999_994, "999.99K"),
+            (999_995, "1M"),
+            (1_000_000, "1M"),
+            (42_567_890, "42.57M"),
+            (1_000_000_000, "1B"),
+            (1_000_000_000_000, "1T"),
+        ] {
+            assert_eq!(
+                format_token_count(tokens, UsageDisplayMode::Summary),
+                expected
+            );
+            assert_eq!(
+                format_token_count(tokens, UsageDisplayMode::Detailed),
+                tokens.to_string()
+            );
+        }
+        assert_eq!(format_compact_value(1_250.0), "1.25K");
+        assert_eq!(
+            format_average_tokens(100_000, 3, UsageDisplayMode::Summary),
+            "33.33K"
+        );
+        assert_eq!(
+            format_average_tokens(100_000, 3, UsageDisplayMode::Detailed),
+            "33333.33"
+        );
     }
 }

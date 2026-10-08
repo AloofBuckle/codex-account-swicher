@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           cas
-Version:        0.1.36
+Version:        0.1.37
 Release:        1%{?dist}
 Summary:        ChatGPT account switcher for Codex
 License:        Unlicense
@@ -25,6 +25,13 @@ install -Dpm0644 %{SOURCE1} %{buildroot}%{_licensedir}/%{name}/LICENSE
 %license %{_licensedir}/%{name}/LICENSE
 
 %changelog
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.37-1
+- Add --summary and --detailed display modes to usage, cost, and price
+- Default to compact K/M/B token counts and compact token averages
+- Hide per-model usage, per-model pricing, and scan warnings in summary mode
+- Preserve full exact numbers, detailed breakdowns, and warnings with --detailed
+- Keep --json complete and lossless regardless of display mode
+
 * Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.36-1
 - Display per-model tool-call averages, cache hit rate, and average response output
 - Define new input as total input minus cached reads, including cache writes
