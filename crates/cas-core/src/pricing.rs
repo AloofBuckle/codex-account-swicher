@@ -448,6 +448,8 @@ mod tests {
                 output_tokens: output,
                 reasoning_output_tokens: 0,
             },
+            tool_calls: 0,
+            tool_call_ids: Vec::new(),
             request_context_tokens: Some(input),
             model_context_window: None,
             price: None,

@@ -110,6 +110,11 @@ pub struct UsageRecord {
     pub response_id: Option<String>,
     pub turn_id: Option<String>,
     pub tokens: TokenCounts,
+    /// Number of unique tool calls emitted by this response, when the call
+    /// event can be associated with its following token usage record.
+    pub tool_calls: usize,
+    #[serde(skip)]
+    pub(crate) tool_call_ids: Vec<String>,
     /// Provider-reported input tokens for this individual response, including
     /// cached tokens. This is the input-side size for long-context pricing.
     /// None if legacy totals only allowed a cumulative-delta estimate.
@@ -204,6 +209,9 @@ pub struct UsageReport {
     pub files_scanned: usize,
     pub files_with_usage: usize,
     pub responses: usize,
+    /// Unique tool invocations associated with included, deduplicated token
+    /// usage records; outputs and unmatched tool events are not counted.
+    pub tool_calls: usize,
     pub duplicate_responses: usize,
     pub ignored_legacy_records: usize,
     pub unmatched_legacy_records: usize,
@@ -285,6 +293,7 @@ pub fn scan_codex_usage_in_range(
     files.dedup();
 
     let mut seen = HashSet::new();
+    let mut seen_tool_ids = HashSet::new();
     let mut by_model: BTreeMap<String, ModelUsage> = BTreeMap::new();
     let mut by_tier: BTreeMap<Option<String>, TierUsage> = BTreeMap::new();
     for path in files {
@@ -366,6 +375,19 @@ pub fn scan_codex_usage_in_range(
                 false
             }
         });
+
+        let thread = session
+            .session_id
+            .as_deref()
+            .unwrap_or_else(|| path.to_str().unwrap_or("unidentified-rollout"));
+        for record in &mut session.records {
+            record.tool_calls = record
+                .tool_call_ids
+                .iter()
+                .filter(|call_id| seen_tool_ids.insert(format!("{thread}:{call_id}")))
+                .count();
+            report.tool_calls += record.tool_calls;
+        }
 
         if !session.records.is_empty() {
             report.files_with_usage += 1;
@@ -556,6 +578,7 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
         .into_owned();
     let mut legacy_index = 0usize;
     let mut physical_line = 0usize;
+    let mut pending_tool_calls: Vec<String> = Vec::new();
 
     loop {
         line.clear();
@@ -564,16 +587,30 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
         }
         physical_line += 1;
         let has_newline = line.ends_with(b"\n");
-        // Fast path: skip message and tool bodies without deserializing them.
-        if ![
-            b"\"session_meta\"".as_slice(),
-            b"\"turn_context\"",
-            b"\"token_count\"",
-            b"\"token_usage_record\"",
-            b"\"thread_settings_applied\"",
-        ]
-        .iter()
-        .any(|needle| line.windows(needle.len()).any(|window| window == *needle))
+        // Read tool-call metadata but skip tool outputs and regular messages;
+        // tool-call arguments are never inspected or retained.
+        let tool_call_item = line
+            .windows(b"\"response_item\"".len())
+            .any(|window| window == b"\"response_item\"")
+            && [
+                b"\"function_call\"".as_slice(),
+                b"\"custom_tool_call\"",
+                b"\"web_search_call\"",
+                b"\"file_search_call\"",
+                b"\"computer_call\"",
+            ]
+            .iter()
+            .any(|needle| line.windows(needle.len()).any(|window| window == *needle));
+        if !tool_call_item
+            && ![
+                b"\"session_meta\"".as_slice(),
+                b"\"turn_context\"",
+                b"\"token_count\"",
+                b"\"token_usage_record\"",
+                b"\"thread_settings_applied\"",
+            ]
+            .iter()
+            .any(|needle| line.windows(needle.len()).any(|window| window == *needle))
         {
             if !has_newline && serde_json::from_slice::<Value>(&line).is_err() {
                 session.incomplete_tail = true;
@@ -600,6 +637,17 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
             .and_then(Value::as_str)
             .map(str::to_owned);
         match event_type {
+            Some("response_item")
+                if is_tool_call_type(payload.get("type").and_then(Value::as_str)) =>
+            {
+                let call_id = payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("line:{file_identity}:{physical_line}"));
+                pending_tool_calls.push(call_id);
+            }
             Some("session_meta") => {
                 session.session_id = payload
                     .get("id")
@@ -644,6 +692,10 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
                     .map(normalize_requested_tier);
             }
             Some("token_usage_record") => {
+                // A tool invocation belongs to the model response that
+                // emitted it. Codex persists the tool-call response_item
+                // before the corresponding token_usage_record.
+                let call_ids = std::mem::take(&mut pending_tool_calls);
                 let Some(usage) = payload.get("usage").and_then(parse_tokens) else {
                     session.invalid_usage_records += 1;
                     continue;
@@ -675,6 +727,8 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
                         turn_id,
                         request_context_tokens: Some(usage.tokens.input_tokens),
                         tokens: usage.tokens,
+                        tool_calls: 0,
+                        tool_call_ids: call_ids,
                         model_context_window: context_window,
                         price: None,
                         dedup_id,
@@ -769,6 +823,8 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
                         turn_id: None,
                         request_context_tokens,
                         tokens,
+                        tool_calls: 0,
+                        tool_call_ids: std::mem::take(&mut pending_tool_calls),
                         model_context_window: context_window,
                         price: None,
                         dedup_id: format!("legacy:{file_identity}:{legacy_index}"),
@@ -814,6 +870,19 @@ fn parse_codex_file(path: &Path) -> Result<SessionUsage> {
         }
     }
     Ok(session)
+}
+
+fn is_tool_call_type(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        Some(
+            "function_call"
+                | "custom_tool_call"
+                | "web_search_call"
+                | "file_search_call"
+                | "computer_call"
+        )
+    )
 }
 
 fn normalize_requested_tier(value: &str) -> String {
@@ -879,6 +948,12 @@ mod tests {
         json!({"type":"token_usage_record","payload":{
             "thread_id":"thread-1", "turn_id":"turn-1", "response_id":id,
             "usage":{"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output,"reasoning_output_tokens":5}
+        }})
+    }
+
+    fn tool_call(kind: &str, id: &str) -> Value {
+        json!({"type":"response_item","payload":{
+            "type":kind,"call_id":id,"name":"functions.exec","input":"ignored"
         }})
     }
 
@@ -954,6 +1029,101 @@ mod tests {
             report.sessions[0].records[0].request_context_tokens,
             Some(130)
         );
+    }
+
+    #[test]
+    fn tool_averages_count_calls_not_outputs_and_ignore_orphan_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tools.jsonl");
+        write_lines(
+            &file,
+            &[
+                meta("one"),
+                model("gpt-6-sol"),
+                tool_call("custom_tool_call", "call-one"),
+                tool_call("function_call", "call-two"),
+                json!({"type":"response_item","payload":{
+                    "type":"custom_tool_call_output","call_id":"call-one","output":"ignored"
+                }}),
+                modern("resp1", 100, 80, 12),
+                tool_call("custom_tool_call", "call-three"),
+                modern("resp2", 200, 100, 8),
+                tool_call("custom_tool_call", "orphan-without-token-record"),
+            ],
+        );
+        let report = scan_codex_usage(&paths(&dir), Some(&file)).unwrap();
+        assert_eq!(report.responses, 2);
+        assert_eq!(report.tool_calls, 3);
+        assert_eq!(report.sessions[0].records[0].tool_calls, 2);
+        assert_eq!(report.sessions[0].records[1].tool_calls, 1);
+        assert_eq!(report.totals.input_tokens, 300);
+        assert_eq!(report.totals.cached_input_tokens, 180);
+        assert_eq!(report.totals.output_tokens, 20);
+    }
+
+    #[test]
+    fn tool_calls_are_deduplicated_across_archives_and_within_responses() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(&dir);
+        let originals = [
+            meta("one"),
+            model("gpt-6-sol"),
+            tool_call("custom_tool_call", "same-tool"),
+            tool_call("custom_tool_call", "same-tool"),
+            modern("same-response", 100, 10, 2),
+        ];
+        write_lines(
+            &paths.codex_home.join("sessions/2026/10/08/orig.jsonl"),
+            &originals,
+        );
+        write_lines(
+            &paths.codex_home.join("archived_sessions/orig.jsonl"),
+            &originals,
+        );
+        let report = scan_codex_usage(&paths, None).unwrap();
+        assert_eq!(report.responses, 1);
+        assert_eq!(report.duplicate_responses, 1);
+        assert_eq!(report.tool_calls, 1);
+    }
+
+    #[test]
+    fn tool_count_and_token_total_use_the_same_response_time_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("timed-tools.jsonl");
+        let stamped = |mut value: Value, time: &str| {
+            value["timestamp"] = json!(time);
+            value
+        };
+        write_lines(
+            &file,
+            &[
+                meta("one"),
+                model("gpt-6-sol"),
+                stamped(tool_call("custom_tool_call", "old"), "2026-10-07T21:00:00Z"),
+                stamped(modern("old", 100, 90, 5), "2026-10-07T21:00:01Z"),
+                stamped(
+                    tool_call("custom_tool_call", "today"),
+                    "2026-10-08T08:00:00Z",
+                ),
+                stamped(modern("today", 200, 150, 6), "2026-10-08T08:00:01Z"),
+            ],
+        );
+        let bounds = UsageTimeRange::new(
+            DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")
+                .unwrap()
+                .to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-09T00:00:00Z")
+                .unwrap()
+                .to_utc(),
+        )
+        .unwrap();
+        let report = scan_codex_usage_in_range(&paths(&dir), Some(&file), Some(bounds)).unwrap();
+        assert_eq!(report.responses, 1);
+        assert_eq!(report.tool_calls, 1);
+        assert_eq!(report.totals.input_tokens, 200);
+        assert_eq!(report.totals.cached_input_tokens, 150);
+        assert_eq!(report.totals.output_tokens, 6);
+        assert_eq!(report.excluded_outside_range, 1);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           cas
-Version:        0.1.34
+Version:        0.1.35
 Release:        1%{?dist}
 Summary:        ChatGPT account switcher for Codex
 License:        Unlicense
@@ -25,6 +25,12 @@ install -Dpm0644 %{SOURCE1} %{buildroot}%{_licensedir}/%{name}/LICENSE
 %license %{_licensedir}/%{name}/LICENSE
 
 %changelog
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.35-1
+- Register only separate CLI names and aliases, never slash-joined commands
+- Add independent usage, cost, price aliases and update help for all command groups
+- Reorder local usage output into model, totals, cache hit, averages, speed, and prices
+- Count unique tool invocations associated with billable responses without counting tool outputs
+
 * Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.34-1
 - Display the actual active auth and its plan in switch and delete selectors
 - Highlight the active account; mark the active delete row as protected

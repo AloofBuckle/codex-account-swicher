@@ -79,6 +79,22 @@ fn usd_field(label_text: &str, usd: &str) -> String {
     field(label_text, &format!("${usd}"), Color::Green)
 }
 
+fn format_average_tokens(tokens: u64, count: usize) -> String {
+    if count == 0 {
+        if zh() { "不可用" } else { "N/A" }.to_owned()
+    } else {
+        format!("{:.2}", tokens as f64 / count as f64)
+    }
+}
+
+fn format_cache_hit_rate(cached: u64, input: u64) -> String {
+    if input == 0 {
+        if zh() { "不可用" } else { "N/A" }.to_owned()
+    } else {
+        format!("{:.2}%", cached as f64 * 100.0 / input as f64)
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "cas", version, about = "ChatGPT Account Switcher for Codex")]
 struct Cli {
@@ -99,28 +115,28 @@ enum Command {
         account: Option<String>,
     },
     /// Concurrently send a clean streaming hello with every saved account.
-    #[command(name = "test/refresh", aliases = ["test", "refresh"])]
+    #[command(name = "test", visible_alias = "refresh")]
     TestRefresh,
     /// Stop Codex and switch accounts. With no target, open an interactive selector.
-    #[command(name = "switch/enable", aliases = ["switch", "enable"])]
+    #[command(name = "switch", visible_alias = "enable")]
     Switch {
         /// Case-insensitive email prefix. Multiple matches open the account selector.
         account: Option<String>,
     },
     /// Import one auth.json. With no path, import the current user's .codex/auth.json.
-    #[command(name = "import/input", aliases = ["import", "input"])]
+    #[command(name = "import", visible_alias = "input")]
     Input {
         /// Path to one auth.json file.
         path: Option<PathBuf>,
     },
     /// Remove one saved account; active auth requires confirmation and Codex shutdown.
-    #[command(name = "remove/delete", aliases = ["remove", "delete"])]
+    #[command(name = "remove", visible_alias = "delete")]
     Remove {
         /// Complete email address. Multiple account matches open the account selector.
         email: Option<String>,
     },
     /// Estimate Codex JSONL usage with an interactive date filter on terminals.
-    #[command(name = "usage/price", aliases = ["usage", "price"])]
+    #[command(name = "usage", visible_aliases = ["cost", "price"])]
     Usage {
         /// Optional JSONL file or directory; defaults to CODEX_HOME sessions and archives.
         path: Option<PathBuf>,
@@ -585,25 +601,17 @@ impl Command {
         match self {
             Self::Login { .. } => "login",
             Self::Status { .. } => "status",
-            Self::TestRefresh => "test/refresh",
+            Self::TestRefresh => "test",
             Self::Switch { .. } => "switch",
-            Self::Input { .. } => "input",
+            Self::Input { .. } => "import",
             Self::Remove { .. } => "remove",
-            Self::Usage { .. } => "usage/price",
+            Self::Usage { .. } => "usage",
         }
     }
 }
 
 fn print_local_usage(report: &UsageReport) {
     let chinese = zh();
-    println!(
-        "{}",
-        label(if chinese {
-            "Codex 本地 JSONL 用量统计（不联网、只读）"
-        } else {
-            "Codex local JSONL usage (offline, read-only)"
-        })
-    );
     println!(
         "{}",
         label(if chinese {
@@ -638,48 +646,6 @@ fn print_local_usage(report: &UsageReport) {
             ]
             .join(&separator())
         );
-        println!(
-            "{}",
-            [
-                count_field(
-                    if chinese {
-                        "区间外响应"
-                    } else {
-                        "outside range"
-                    },
-                    report.excluded_outside_range,
-                    Color::White
-                ),
-                count_field(
-                    if chinese {
-                        "时间缺失已跳过"
-                    } else {
-                        "untimed excluded"
-                    },
-                    report.excluded_without_timestamp,
-                    if report.excluded_without_timestamp == 0 {
-                        Color::Green
-                    } else {
-                        Color::Yellow
-                    }
-                ),
-            ]
-            .join(&separator())
-        );
-    }
-    if report.files_scanned == 0 {
-        println!(
-            "{}",
-            paint(
-                if chinese {
-                    "未发现 JSONL 会话文件；请检查 CODEX_HOME 或通过 cas usage [路径] 指定位置。"
-                } else {
-                    "No session JSONL files found; check CODEX_HOME or pass a path to cas usage."
-                },
-                Color::Yellow
-            )
-        );
-        return;
     }
 
     let counts = &report.totals;
@@ -717,6 +683,95 @@ fn print_local_usage(report: &UsageReport) {
         ]
         .join(&separator())
     );
+    if report.time_range.is_some() {
+        println!(
+            "{}",
+            [
+                count_field(
+                    if chinese {
+                        "区间外响应"
+                    } else {
+                        "outside range"
+                    },
+                    report.excluded_outside_range,
+                    Color::White,
+                ),
+                count_field(
+                    if chinese {
+                        "时间缺失已跳过"
+                    } else {
+                        "untimed excluded"
+                    },
+                    report.excluded_without_timestamp,
+                    if report.excluded_without_timestamp == 0 {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    },
+                ),
+            ]
+            .join(&separator())
+        );
+    }
+    if report.files_scanned == 0 {
+        println!(
+            "{}",
+            paint(
+                if chinese {
+                    "未发现 JSONL 会话文件；请检查 CODEX_HOME 或通过 cas usage [路径] 指定位置。"
+                } else {
+                    "No session JSONL files found; check CODEX_HOME or pass a path to cas usage."
+                },
+                Color::Yellow,
+            )
+        );
+        return;
+    }
+    println!("{}", label(if chinese { "按模型：" } else { "By model:" }));
+    for item in &report.models {
+        let parts = [
+            count_field(
+                if chinese { "响应" } else { "responses" },
+                item.responses,
+                Color::Green,
+            ),
+            count_field(
+                if chinese { "输入" } else { "input" },
+                item.tokens.input_tokens,
+                Color::White,
+            ),
+            count_field(
+                if chinese {
+                    "缓存读取"
+                } else {
+                    "cache read"
+                },
+                item.tokens.cached_input_tokens,
+                Color::Magenta,
+            ),
+            count_field(
+                if chinese {
+                    "缓存写入"
+                } else {
+                    "cache write"
+                },
+                item.tokens.cache_write_input_tokens,
+                Color::Blue,
+            ),
+            count_field(
+                if chinese { "输出" } else { "output" },
+                item.tokens.output_tokens,
+                Color::White,
+            ),
+        ];
+        println!(
+            "  {}{}{}",
+            paint(&item.model, Color::Magenta),
+            dim(if chinese { "：" } else { ": " }),
+            parts.join(&separator())
+        );
+    }
+    println!("{}", label(if chinese { "总计：" } else { "Totals:" }));
     println!(
         "{}",
         [
@@ -768,56 +823,75 @@ fn print_local_usage(report: &UsageReport) {
         ]
         .join(&separator())
     );
-    println!("{}", label(if chinese { "按模型：" } else { "By model:" }));
-    for item in &report.models {
-        let parts = [
-            count_field(
-                if chinese { "响应" } else { "responses" },
-                item.responses,
-                Color::Green,
-            ),
-            count_field(
-                if chinese { "输入" } else { "input" },
-                item.tokens.input_tokens,
-                Color::White,
-            ),
-            count_field(
+    println!(
+        "{}",
+        field(
+            if chinese {
+                "缓存命中率"
+            } else {
+                "cache hit rate"
+            },
+            &format_cache_hit_rate(counts.cached_input_tokens, counts.input_tokens),
+            Color::Green,
+        )
+    );
+    println!(
+        "{}{}",
+        label(if chinese {
+            "平均每工具用量："
+        } else {
+            "Average per tool call: "
+        }),
+        [
+            field(
                 if chinese {
-                    "缓存读取"
+                    "缓存输入"
                 } else {
-                    "cache read"
+                    "cached input"
                 },
-                item.tokens.cached_input_tokens,
+                &format_average_tokens(counts.cached_input_tokens, report.tool_calls),
                 Color::Magenta,
             ),
-            count_field(
-                if chinese {
-                    "缓存写入"
-                } else {
-                    "cache write"
-                },
-                item.tokens.cache_write_input_tokens,
-                Color::Blue,
-            ),
-            count_field(
-                if chinese { "输出" } else { "output" },
-                item.tokens.output_tokens,
+            field(
+                if chinese { "输入" } else { "input" },
+                &format_average_tokens(counts.input_tokens, report.tool_calls),
                 Color::White,
             ),
-        ];
-        println!(
-            "  {}{}{}",
-            paint(&item.model, Color::Magenta),
-            dim(if chinese { "：" } else { ": " }),
-            parts.join(&separator())
-        );
-    }
+            field(
+                if chinese { "输出" } else { "output" },
+                &format_average_tokens(counts.output_tokens, report.tool_calls),
+                Color::White,
+            ),
+            count_field(
+                if chinese {
+                    "工具调用"
+                } else {
+                    "tool calls"
+                },
+                report.tool_calls,
+                Color::Green,
+            ),
+        ]
+        .join(&separator())
+    );
+    println!(
+        "{}",
+        field(
+            if chinese {
+                "平均每请求输出"
+            } else {
+                "average response output"
+            },
+            &format_average_tokens(counts.output_tokens, report.responses),
+            Color::Green,
+        )
+    );
     println!(
         "{}",
         label(if chinese {
-            "请求 tier（日志配置值，非服务端实际执行值）："
+            "速度/fast："
         } else {
-            "Requested tier (logged preference, not server-confirmed):"
+            "Speed/fast:"
         })
     );
     for tier in &report.tiers {
@@ -856,14 +930,7 @@ fn print_local_usage(report: &UsageReport) {
         );
     }
     let price = &report.pricing;
-    println!(
-        "{}",
-        label(if chinese {
-            "OpenAI API 标准费率参考（USD，仅文本 Token）："
-        } else {
-            "OpenAI API Standard rate reference (USD, text tokens only):"
-        })
-    );
+    println!("{}", label(if chinese { "总价：" } else { "Total price:" }));
     println!(
         "  {}",
         [
@@ -900,9 +967,9 @@ fn print_local_usage(report: &UsageReport) {
     println!(
         "{}",
         label(if chinese {
-            "按精确模型 ID 计价："
+            "分价："
         } else {
-            "Pricing by exact model ID:"
+            "Price breakdown:"
         })
     );
     for item in &price.models {
@@ -947,11 +1014,7 @@ fn print_local_usage(report: &UsageReport) {
     if report.warning_count > 0 {
         eprintln!(
             "{}{}:",
-            label(if chinese {
-                "扫描警告"
-            } else {
-                "Scan warnings"
-            }),
+            label(if chinese { "警告" } else { "Warnings " }),
             paint(report.warning_count.to_string(), Color::Yellow)
         );
         for warning in &report.warnings {
@@ -967,9 +1030,9 @@ fn print_local_usage(report: &UsageReport) {
     println!(
         "{}",
         dim(if chinese {
-            "注：标准 API 参考价非实际账单；未对无法验证的 Fast 执行 tier 加价。"
+            "仅供参考"
         } else {
-            "Note: Standard API reference is not actual billing; no unverified Fast-tier surcharges."
+            "For reference only"
         })
     );
 }
@@ -984,7 +1047,11 @@ fn maybe_print_localized_help() -> bool {
     }
 
     if args[1] == "help" {
-        print_ui_help(args.get(2).map(String::as_str));
+        let target = args.get(2).map(String::as_str);
+        if target.is_some_and(|name| !is_known_help_target(name)) {
+            return false; // Clap reports unknown slash-separated names.
+        }
+        print_ui_help(target);
         return true;
     }
 
@@ -997,11 +1064,33 @@ fn maybe_print_localized_help() -> bool {
             .get(1)
             .filter(|arg| arg.as_str() != "-h" && arg.as_str() != "--help")
             .map(String::as_str);
+        if target.is_some_and(|name| !is_known_help_target(name)) {
+            return false;
+        }
         print_ui_help(target);
         return true;
     }
 
     false
+}
+
+fn is_known_help_target(name: &str) -> bool {
+    matches!(
+        name,
+        "login"
+            | "status"
+            | "test"
+            | "refresh"
+            | "switch"
+            | "enable"
+            | "import"
+            | "input"
+            | "remove"
+            | "delete"
+            | "usage"
+            | "cost"
+            | "price"
+    )
 }
 
 fn print_ui_help(target: Option<&str>) {
@@ -1027,23 +1116,23 @@ fn print_ui_help(target: Option<&str>) {
         "status" => println!(
             "刷新凭据有效性和 Codex 剩余用量\n\n用法：cas status [账号]\n\n参数：\n  [账号]  不区分大小写的邮箱前缀；多个匹配时进入账号选择器\n\n选项：\n  -h, --help  显示帮助"
         ),
-        "test" | "refresh" | "test/refresh" => println!(
-            "并发测试所有已保存账号\n\n用法：cas test/refresh\n\n行为：\n  使用每个已保存 auth 向 gpt-6-luna 发送一个流式、无上下文的 hello，并选择模型声明支持的最低 reasoning effort\n\n选项：\n  -h, --help  显示帮助"
+        "test" | "refresh" => println!(
+            "并发测试所有已保存账号\n\n用法：cas test 或 cas refresh\n\n行为：\n  使用每个已保存 auth 向 gpt-6-luna 发送一个流式、无上下文的 hello，并选择模型声明支持的最低 reasoning effort\n\n选项：\n  -h, --help  显示帮助"
         ),
-        "switch" | "enable" | "switch/enable" => println!(
-            "结束 Codex 并切换账号\n\n用法：cas switch/enable [账号]\n\n参数：\n  [账号]  不区分大小写的邮箱前缀；多个匹配时进入账号选择器\n\n选项：\n  -h, --help  显示帮助"
+        "switch" | "enable" => println!(
+            "结束 Codex 并切换账号\n\n用法：cas switch [账号] 或 cas enable [账号]\n\n参数：\n  [账号]  不区分大小写的邮箱前缀；多个匹配时进入账号选择器\n\n选项：\n  -h, --help  显示帮助"
         ),
-        "import" | "input" | "import/input" => println!(
-            "导入一个 auth.json\n\n用法：cas import/input [路径]\n\n参数：\n  [路径]  auth.json 路径；不指定时导入当前 ~/.codex/auth.json\n\n选项：\n  -h, --help  显示帮助"
+        "import" | "input" => println!(
+            "导入一个 auth.json\n\n用法：cas import [路径] 或 cas input [路径]\n\n参数：\n  [路径]  auth.json 路径；不指定时导入当前 ~/.codex/auth.json\n\n选项：\n  -h, --help  显示帮助"
         ),
-        "remove" | "delete" | "remove/delete" => println!(
-            "删除一个已保存账号\n\n用法：cas remove/delete [完整邮箱]\n\n参数：\n  [完整邮箱]  完整邮箱地址；同邮箱多个账号ID时进入账号选择器\n\n行为：\n  当前生效 auth 在列表中标为锁定，删除前需再次交互确认。\n  确认后先关闭 Codex 进程，再删除当前 auth.json 及 CAS 中保存的对应账号；其他账号不受影响。\n  非交互终端不允许删除生效账号。\n\n选项：\n  -h, --help  显示帮助"
+        "remove" | "delete" => println!(
+            "删除一个已保存账号\n\n用法：cas remove [完整邮箱] 或 cas delete [完整邮箱]\n\n参数：\n  [完整邮箱]  完整邮箱地址；同邮箱多个账号ID时进入账号选择器\n\n行为：\n  当前生效 auth 在列表中标为锁定，删除前需再次交互确认。\n  确认后先关闭 Codex 进程，再删除当前 auth.json 及 CAS 中保存的对应账号；其他账号不受影响。\n  非交互终端不允许删除生效账号。\n\n选项：\n  -h, --help  显示帮助"
         ),
-        "usage" | "price" | "usage/price" => println!(
-            "只读统计 Codex 本地 JSONL 用量及 API 等价美元费用\n\n用法：cas usage/price [路径] [--json]\n\n参数：\n  [路径]    可选 JSONL 文件或目录；默认扫描 CODEX_HOME/sessions 与 archived_sessions\n\n交互选择：\n  1d（今天）、24h、3d、7d、1m、all，或手动输入起始和终止日期。\n  手动编辑 yyyy/mm/dd/hh/mm，上下键切换，留空字段按当前时间填充。\n  --json 或重定向输出时不弹出选择页面，默认统计全部。\n\n行为：\n  仅精确匹配 GPT-5.2 至 GPT-6.1 官方模型 ID；支持缓存和长上下文。\n  按官方 2026-10-08 标准价格快照计价，不推断 Fast 实际执行 tier，非 ChatGPT 实际扣费。\n\n选项：\n  --json      输出逐响应 Token、计价和汇总 JSON\n  -h, --help  显示帮助"
+        "usage" | "cost" | "price" => println!(
+            "只读统计 Codex 本地 JSONL 用量及 API 等价美元费用\n\n用法：cas usage [路径] [--json]\n      cas cost [路径] [--json]\n      cas price [路径] [--json]\n\n参数：\n  [路径]    可选 JSONL 文件或目录；默认扫描 CODEX_HOME/sessions 与 archived_sessions\n\n交互选择：\n  1d（今天）、24h、3d、7d、1m、all，或手动输入起始和终止日期。\n  手动编辑 yyyy/mm/dd/hh/mm，上下键切换，留空字段按当前时间填充。\n  --json 或重定向输出时不弹出选择页面，默认统计全部。\n\n行为：\n  仅精确匹配 GPT-5.2 至 GPT-6.1 官方模型 ID；支持缓存和长上下文。\n  按官方 2026-10-08 标准价格快照计价，不推断 Fast 实际执行 tier，非 ChatGPT 实际扣费。\n\n选项：\n  --json      输出逐响应 Token、计价和汇总 JSON\n  -h, --help  显示帮助"
         ),
         _ => println!(
-            "Codex 的 ChatGPT 账号切换器\n\n用法：cas [命令]\n\n命令：\n  login          登录 ChatGPT 账号\n  status         刷新凭据有效性和 Codex 剩余用量\n  test/refresh   并发测试所有账号的 gpt-6-luna 流式响应\n  switch/enable  结束 Codex 并切换账号\n  import/input   导入 auth.json\n  remove/delete  删除已保存账号\n  usage/price    只读统计本地 JSONL Token 消耗及 API 等价美元价格\n  help           显示帮助\n\n选项：\n  -h, --help     显示帮助\n  -V, --version  显示版本"
+            "Codex 的 ChatGPT 账号切换器\n\n用法：cas [命令]\n\n命令（每个名字单独使用）：\n  login                登录 ChatGPT 账号\n  status               刷新凭据有效性和 Codex 剩余用量\n  test、refresh         并发测试所有账号的 gpt-6-luna 流式响应\n  switch、enable        结束 Codex 并切换账号\n  import、input         导入 auth.json\n  remove、delete        删除已保存账号\n  usage、cost、price     只读统计本地 JSONL Token 消耗及 API 等价美元价格\n  help                 显示帮助\n\n选项：\n  -h, --help           显示帮助\n  -V, --version        显示版本"
         ),
     }
 }
@@ -1332,12 +1421,12 @@ fn select_login_method() -> cas_core::Result<Option<LoginMethod>> {
 fn select_main_action() -> cas_core::Result<Option<MainAction>> {
     const ACTIONS: &[(MainAction, &str)] = &[
         (MainAction::Status, "status"),
-        (MainAction::TestRefresh, "test/refresh"),
-        (MainAction::Switch, "switch/enable"),
+        (MainAction::TestRefresh, "test / refresh"),
+        (MainAction::Switch, "switch / enable"),
         (MainAction::Login, "login"),
-        (MainAction::Input, "import/input"),
-        (MainAction::Remove, "remove/delete"),
-        (MainAction::Usage, "usage/price"),
+        (MainAction::Input, "import / input"),
+        (MainAction::Remove, "remove / delete"),
+        (MainAction::Usage, "usage / cost / price"),
         (MainAction::Help, "help"),
     ];
     let labels: Vec<_> = ACTIONS
@@ -1786,13 +1875,14 @@ fn print_test_result(result: &cas_core::AccountTestResult) {
 mod tests {
     use super::{
         AccountSelectionMode, Cli, Command, cycle_selection, format_account_choice,
-        format_account_choice_for_action, format_current_auth, is_selected_active,
-        menu_rendered_rows, usage_color, visible_width, zh,
+        format_account_choice_for_action, format_average_tokens, format_cache_hit_rate,
+        format_current_auth, is_selected_active, menu_rendered_rows, usage_color, visible_width,
+        zh,
     };
     use cas_core::{
         AccountChoice, AccountRecord, AccountStatusSnapshot, CurrentAccount, UsageWindow,
     };
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use crossterm::style::Color;
 
     #[test]
@@ -1966,7 +2056,7 @@ mod tests {
 
     #[test]
     fn test_refresh_aliases_are_equivalent() {
-        for command in ["test/refresh", "test", "refresh"] {
+        for command in ["test", "refresh"] {
             let cli = Cli::try_parse_from(["cas", command]).unwrap();
             assert!(matches!(cli.command, Some(Command::TestRefresh)));
         }
@@ -2013,7 +2103,7 @@ mod tests {
 
     #[test]
     fn usage_price_aliases_accept_optional_path_and_json() {
-        for command in ["usage", "price", "usage/price"] {
+        for command in ["usage", "cost", "price"] {
             let cli =
                 Cli::try_parse_from(["cas", command, "--json", "/tmp/rollout.jsonl"]).unwrap();
             match cli.command {
@@ -2024,5 +2114,38 @@ mod tests {
                 _ => panic!("{command} did not parse as usage"),
             }
         }
+    }
+
+    #[test]
+    fn no_slash_joined_commands_are_registered() {
+        let command = Cli::command();
+        for entry in command.get_subcommands() {
+            assert!(!entry.get_name().contains('/'), "{}", entry.get_name());
+            for alias in entry.get_all_aliases() {
+                assert!(!alias.contains('/'), "{alias}");
+            }
+        }
+        for invalid in [
+            "usage/price",
+            "usage/cost/price",
+            "test/refresh",
+            "switch/enable",
+            "import/input",
+            "remove/delete",
+        ] {
+            assert!(
+                Cli::try_parse_from(["cas", invalid]).is_err(),
+                "must reject grouped label {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn averaged_usage_and_cache_rates_handle_zero_and_nonzero_denominators() {
+        assert_eq!(format_cache_hit_rate(197_888, 236_437), "83.70%");
+        assert_eq!(format_average_tokens(909, 7), "129.86");
+        assert_eq!(format_average_tokens(100, 4), "25.00");
+        assert!(!format_average_tokens(100, 0).is_empty());
+        assert!(!format_cache_hit_rate(0, 0).is_empty());
     }
 }
