@@ -4,8 +4,9 @@ Name:           cas
 Version:        0.1.28
 Release:        1%{?dist}
 Summary:        ChatGPT account switcher for Codex
-License:        Apache-2.0
+License:        Unlicense
 Source0:        cas
+Source1:        LICENSE
 
 %description
 CAS stores multiple Codex ChatGPT credentials under the current user's
@@ -17,9 +18,11 @@ CAS stores multiple Codex ChatGPT credentials under the current user's
 
 %install
 install -Dpm0755 %{SOURCE0} %{buildroot}%{_bindir}/cas
+install -Dpm0644 %{SOURCE1} %{buildroot}%{_licensedir}/%{name}/LICENSE
 
 %files
 %{_bindir}/cas
+%license %{_licensedir}/%{name}/LICENSE
 
 %changelog
 * Fri Oct 02 2026 CAS Project <cas@localhost> - 0.1.28-1

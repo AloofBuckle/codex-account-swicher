@@ -6,10 +6,12 @@ topdir=$(mktemp -d)
 trap 'rm -rf "$topdir"' EXIT
 
 cd "$repo_root"
-cargo build --release -p cas-cli
+build_target=${CAS_BUILD_TARGET:-x86_64-unknown-linux-musl}
+cargo build --release -p cas-cli --target "$build_target"
 
 mkdir -p "$topdir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-install -m0755 target/release/cas "$topdir/SOURCES/cas"
+install -m0755 "target/$build_target/release/cas" "$topdir/SOURCES/cas"
+install -m0644 LICENSE "$topdir/SOURCES/LICENSE"
 install -m0644 packaging/cas.spec "$topdir/SPECS/cas.spec"
 
 rpmbuild -bb \

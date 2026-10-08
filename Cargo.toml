@@ -9,7 +9,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.28"
 edition = "2024"
-license = "Apache-2.0"
+license = "Unlicense"
 
 [workspace.dependencies]
 atomic-write-file = "0.3.1"
