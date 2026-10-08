@@ -1,4 +1,9 @@
-use cas_core::{AccountChoice, AccountStatus, Cas, CasError, UsageWindow};
+mod usage_range;
+
+use cas_core::{
+    AccountChoice, AccountStatus, Cas, CasError, CasPaths, CurrentAccount, UsageReport,
+    UsageWindow, scan_codex_usage_in_range,
+};
 use chrono::{DateTime, Local, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use crossterm::{
@@ -66,6 +71,14 @@ fn field(label_text: &str, value: &str, color: Color) -> String {
     format!("{}{}{}", label(label_text), dim("="), paint(value, color))
 }
 
+fn count_field(label_text: &str, value: impl std::fmt::Display, color: Color) -> String {
+    field(label_text, &value.to_string(), color)
+}
+
+fn usd_field(label_text: &str, usd: &str) -> String {
+    field(label_text, &format!("${usd}"), Color::Green)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "cas", version, about = "ChatGPT Account Switcher for Codex")]
 struct Cli {
@@ -100,11 +113,20 @@ enum Command {
         /// Path to one auth.json file.
         path: Option<PathBuf>,
     },
-    /// Remove one saved account. With no target, open an interactive selector.
+    /// Remove one saved account; active auth requires confirmation and Codex shutdown.
     #[command(name = "remove/delete", aliases = ["remove", "delete"])]
     Remove {
-        /// Complete email address. Multiple workspace matches open the account selector.
+        /// Complete email address. Multiple account matches open the account selector.
         email: Option<String>,
+    },
+    /// Estimate Codex JSONL usage with an interactive date filter on terminals.
+    #[command(name = "usage/price", aliases = ["usage", "price"])]
+    Usage {
+        /// Optional JSONL file or directory; defaults to CODEX_HOME sessions and archives.
+        path: Option<PathBuf>,
+        /// Print structured statistics, including per-response data, as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -122,11 +144,27 @@ enum MainAction {
     Login,
     Input,
     Remove,
+    Usage,
     Help,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountSelectionMode {
+    General,
+    Switch,
+    Remove,
+}
+
 fn main() {
-    if let Err(error) = cas_core::initialize_http_client() {
+    if maybe_print_localized_help() {
+        return;
+    }
+    let cli = Cli::parse();
+    // Local JSONL usage must work even when HTTP client initialization is
+    // unavailable. The existing network commands retain their startup check.
+    if !matches!(cli.command, Some(Command::Usage { .. }))
+        && let Err(error) = cas_core::initialize_http_client()
+    {
         if zh() {
             eprintln!("错误：HTTP 客户端初始化失败：{error}");
         } else {
@@ -134,10 +172,6 @@ fn main() {
         }
         std::process::exit(1);
     }
-    if maybe_print_localized_help() {
-        return;
-    }
-    let cli = Cli::parse();
     let command_name = cli.command.as_ref().map(Command::name).unwrap_or("cas");
     match run(cli) {
         Ok(()) => {}
@@ -153,7 +187,6 @@ fn main() {
 }
 
 fn run(cli: Cli) -> cas_core::Result<()> {
-    let cas = Cas::discover()?;
     let command = match cli.command {
         Some(command) => command,
         None => {
@@ -167,6 +200,10 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                 MainAction::Login => Command::Login { method: None },
                 MainAction::Input => Command::Input { path: None },
                 MainAction::Remove => Command::Remove { email: None },
+                MainAction::Usage => Command::Usage {
+                    path: None,
+                    json: false,
+                },
                 MainAction::Help => {
                     print_ui_help(None);
                     return Ok(());
@@ -175,6 +212,31 @@ fn run(cli: Cli) -> cas_core::Result<()> {
         }
     };
 
+    // Usage is intentionally self-contained and read-only: do not require an
+    // auth.json, create CAS state directories, or contact the Codex service.
+    if let Command::Usage { path, json } = &command {
+        let paths = CasPaths::discover()?;
+        // Scripts and --json retain the previous noninteractive all-time
+        // behavior. On a terminal the selection UI runs before scanning.
+        let time_range = if !*json && io::stdin().is_terminal() && io::stdout().is_terminal() {
+            match usage_range::choose_usage_range()? {
+                Some(usage_range::UsageRangeChoice::Bounded(range)) => Some(range),
+                Some(usage_range::UsageRangeChoice::All) => None,
+                None => return Ok(()),
+            }
+        } else {
+            None
+        };
+        let report = scan_codex_usage_in_range(&paths, path.as_deref(), time_range)?;
+        if *json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_local_usage(&report);
+        }
+        return Ok(());
+    }
+
+    let cas = Cas::discover()?;
     match command {
         Command::Login { method } => {
             let method = match method {
@@ -235,13 +297,13 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                     .unwrap_or(if zh() { "未知" } else { "unknown" });
             if zh() {
                 println!(
-                    "已保存 {} [工作区={}]。当前 Codex 账号未更改。",
+                    "已保存 {} [账号ID={}]。当前 Codex 账号未更改。",
                     account.display_name(),
                     workspace
                 );
             } else {
                 println!(
-                    "saved {} [workspace={}]. Active Codex account was not changed.",
+                    "saved {} [account ID={}]. Active Codex account was not changed.",
                     account.display_name(),
                     workspace
                 );
@@ -257,7 +319,14 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                     } else {
                         "Status account"
                     };
-                    let Some(account) = select_matching_account(&cas, prompt, matches, &selector)?
+                    let Some(account) = select_matching_account(
+                        &cas,
+                        prompt,
+                        matches,
+                        &selector,
+                        None,
+                        AccountSelectionMode::General,
+                    )?
                     else {
                         return Ok(());
                     };
@@ -303,6 +372,8 @@ fn run(cli: Cli) -> cas_core::Result<()> {
             }
         }
         Command::Switch { account } => {
+            let current = cas.current_account()?;
+            println!("{}", format_current_auth(&current));
             let account = match account.as_deref() {
                 Some(selector) => {
                     let matches = cas.account_choices_prefix(selector)?;
@@ -311,7 +382,14 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                     } else {
                         "Switch account"
                     };
-                    let Some(account) = select_matching_account(&cas, prompt, matches, selector)?
+                    let Some(account) = select_matching_account(
+                        &cas,
+                        prompt,
+                        matches,
+                        selector,
+                        Some(&current),
+                        AccountSelectionMode::Switch,
+                    )?
                     else {
                         return Ok(());
                     };
@@ -335,7 +413,14 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                     } else {
                         "Switch account"
                     };
-                    let Some(account) = select_account(&cas, prompt, &choices)? else {
+                    let Some(account) = select_account(
+                        &cas,
+                        prompt,
+                        &choices,
+                        Some(&current),
+                        AccountSelectionMode::Switch,
+                    )?
+                    else {
                         return Ok(());
                     };
                     account
@@ -355,14 +440,14 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                     .unwrap_or(if zh() { "未知" } else { "unknown" });
             if zh() {
                 println!(
-                    "已切换到 {} [工作区={}]；退出了 {} 个进程。",
+                    "已切换到 {} [账号ID={}]；退出了 {} 个进程。",
                     target_name,
                     workspace,
                     result.terminated_processes.len(),
                 );
             } else {
                 println!(
-                    "switched to {} [workspace={}]; exited {} processes.",
+                    "switched to {} [account ID={}]; exited {} processes.",
                     target_name,
                     workspace,
                     result.terminated_processes.len(),
@@ -396,6 +481,8 @@ fn run(cli: Cli) -> cas_core::Result<()> {
             }
         }
         Command::Remove { email } => {
+            let current = cas.current_account()?;
+            println!("{}", format_current_auth(&current));
             let account = match email.as_deref() {
                 Some(email) => {
                     let matches = cas.account_choices_exact_email(email)?;
@@ -404,7 +491,14 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                     } else {
                         "Remove account"
                     };
-                    let Some(account) = select_matching_account(&cas, prompt, matches, email)?
+                    let Some(account) = select_matching_account(
+                        &cas,
+                        prompt,
+                        matches,
+                        email,
+                        Some(&current),
+                        AccountSelectionMode::Remove,
+                    )?
                     else {
                         return Ok(());
                     };
@@ -428,13 +522,31 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                     } else {
                         "Remove account"
                     };
-                    let Some(account) = select_account(&cas, prompt, &choices)? else {
+                    let Some(account) = select_account(
+                        &cas,
+                        prompt,
+                        &choices,
+                        Some(&current),
+                        AccountSelectionMode::Remove,
+                    )?
+                    else {
                         return Ok(());
                     };
                     account
                 }
             };
-            let removed = cas.remove_id(&account.account.id)?;
+            // An active auth is visually locked and requires an explicit
+            // second confirmation. Ordinary deletions must never stop Codex.
+            let active_removal = is_selected_active(&account, &current);
+            let (removed, terminated_processes) = if active_removal {
+                if !confirm_active_removal(&account)? {
+                    return Ok(());
+                }
+                let result = cas.remove_active_id(&account.account.id)?;
+                (result.account, Some(result.terminated_processes))
+            } else {
+                (cas.remove_id(&account.account.id)?, None)
+            };
             let removed_name = removed
                 .email
                 .clone()
@@ -445,11 +557,24 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                     .as_deref()
                     .unwrap_or(if zh() { "未知" } else { "unknown" });
             if zh() {
-                println!("已删除 {removed_name} [工作区={workspace}]。");
+                println!("已删除 {removed_name} [账号ID={workspace}]。");
+                if let Some(processes) = terminated_processes {
+                    println!(
+                        "已关闭 {} 个 Codex 进程；已移除当前 auth.json，Codex 现处于未登录状态。",
+                        processes.len()
+                    );
+                }
             } else {
-                println!("removed {removed_name} [workspace={workspace}].");
+                println!("removed {removed_name} [account ID={workspace}].");
+                if let Some(processes) = terminated_processes {
+                    println!(
+                        "terminated {} Codex process(es); active auth.json removed; Codex is signed out.",
+                        processes.len()
+                    );
+                }
             }
         }
+        Command::Usage { .. } => unreachable!("usage handled before opening CAS state"),
     }
 
     Ok(())
@@ -464,8 +589,389 @@ impl Command {
             Self::Switch { .. } => "switch",
             Self::Input { .. } => "input",
             Self::Remove { .. } => "remove",
+            Self::Usage { .. } => "usage/price",
         }
     }
+}
+
+fn print_local_usage(report: &UsageReport) {
+    let chinese = zh();
+    println!(
+        "{}",
+        label(if chinese {
+            "Codex 本地 JSONL 用量统计（不联网、只读）"
+        } else {
+            "Codex local JSONL usage (offline, read-only)"
+        })
+    );
+    println!(
+        "{}",
+        label(if chinese {
+            "扫描目录："
+        } else {
+            "Scan roots:"
+        })
+    );
+    for root in &report.scan_roots {
+        println!("  {}", paint(root.display().to_string(), Color::White));
+    }
+    if let Some(range) = report.time_range.as_ref() {
+        let format_time = |timestamp: &DateTime<Utc>| {
+            timestamp
+                .with_timezone(&Local)
+                .format("%Y/%m/%d %H:%M:%S %:z")
+                .to_string()
+        };
+        println!(
+            "{}",
+            [
+                field(
+                    if chinese { "起始" } else { "from" },
+                    &format_time(&range.start),
+                    Color::Green
+                ),
+                field(
+                    if chinese { "终止" } else { "until" },
+                    &format_time(&range.end),
+                    Color::Green
+                ),
+            ]
+            .join(&separator())
+        );
+        println!(
+            "{}",
+            [
+                count_field(
+                    if chinese {
+                        "区间外响应"
+                    } else {
+                        "outside range"
+                    },
+                    report.excluded_outside_range,
+                    Color::White
+                ),
+                count_field(
+                    if chinese {
+                        "时间缺失已跳过"
+                    } else {
+                        "untimed excluded"
+                    },
+                    report.excluded_without_timestamp,
+                    if report.excluded_without_timestamp == 0 {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    }
+                ),
+            ]
+            .join(&separator())
+        );
+    }
+    if report.files_scanned == 0 {
+        println!(
+            "{}",
+            paint(
+                if chinese {
+                    "未发现 JSONL 会话文件；请检查 CODEX_HOME 或通过 cas usage [路径] 指定位置。"
+                } else {
+                    "No session JSONL files found; check CODEX_HOME or pass a path to cas usage."
+                },
+                Color::Yellow
+            )
+        );
+        return;
+    }
+
+    let counts = &report.totals;
+    println!(
+        "{}",
+        [
+            count_field(
+                if chinese { "文件" } else { "files" },
+                report.files_scanned,
+                Color::White
+            ),
+            count_field(
+                if chinese { "有用量" } else { "with usage" },
+                report.files_with_usage,
+                Color::Green
+            ),
+            count_field(
+                if chinese { "响应" } else { "responses" },
+                report.responses,
+                Color::Green
+            ),
+            count_field(
+                if chinese {
+                    "跨文件重复"
+                } else {
+                    "duplicates"
+                },
+                report.duplicate_responses,
+                if report.duplicate_responses == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }
+            ),
+        ]
+        .join(&separator())
+    );
+    println!(
+        "{}",
+        [
+            count_field(
+                if chinese { "输入" } else { "input" },
+                counts.input_tokens,
+                Color::White
+            ),
+            count_field(
+                if chinese { "新增" } else { "fresh" },
+                counts.fresh_input_tokens(),
+                Color::Yellow
+            ),
+            count_field(
+                if chinese {
+                    "缓存读取"
+                } else {
+                    "cache read"
+                },
+                counts.cached_input_tokens,
+                Color::Magenta
+            ),
+            count_field(
+                if chinese {
+                    "缓存写入"
+                } else {
+                    "cache write"
+                },
+                counts.cache_write_input_tokens,
+                Color::Blue
+            ),
+        ]
+        .join(&separator())
+    );
+    println!(
+        "{}",
+        [
+            count_field(
+                if chinese { "输出" } else { "output" },
+                counts.output_tokens,
+                Color::White
+            ),
+            count_field(
+                if chinese { "推理" } else { "reasoning" },
+                counts.reasoning_output_tokens,
+                Color::Magenta
+            ),
+            count_field("Token", counts.total_tokens(), Color::Green),
+        ]
+        .join(&separator())
+    );
+    println!("{}", label(if chinese { "按模型：" } else { "By model:" }));
+    for item in &report.models {
+        let parts = [
+            count_field(
+                if chinese { "响应" } else { "responses" },
+                item.responses,
+                Color::Green,
+            ),
+            count_field(
+                if chinese { "输入" } else { "input" },
+                item.tokens.input_tokens,
+                Color::White,
+            ),
+            count_field(
+                if chinese {
+                    "缓存读取"
+                } else {
+                    "cache read"
+                },
+                item.tokens.cached_input_tokens,
+                Color::Magenta,
+            ),
+            count_field(
+                if chinese {
+                    "缓存写入"
+                } else {
+                    "cache write"
+                },
+                item.tokens.cache_write_input_tokens,
+                Color::Blue,
+            ),
+            count_field(
+                if chinese { "输出" } else { "output" },
+                item.tokens.output_tokens,
+                Color::White,
+            ),
+        ];
+        println!(
+            "  {}{}{}",
+            paint(&item.model, Color::Magenta),
+            dim(if chinese { "：" } else { ": " }),
+            parts.join(&separator())
+        );
+    }
+    println!(
+        "{}",
+        label(if chinese {
+            "请求 tier（日志配置值，非服务端实际执行值）："
+        } else {
+            "Requested tier (logged preference, not server-confirmed):"
+        })
+    );
+    for tier in &report.tiers {
+        let value = tier
+            .requested_service_tier
+            .as_deref()
+            .unwrap_or(if chinese { "未知" } else { "unknown" });
+        let tier_color = match tier.requested_service_tier.as_deref() {
+            Some("default" | "standard") => Color::Green,
+            Some("priority" | "fast" | "ultrafast") => Color::Yellow,
+            Some("flex") => Color::Blue,
+            _ => Color::Yellow,
+        };
+        let parts = [
+            count_field(
+                if chinese { "响应" } else { "responses" },
+                tier.responses,
+                Color::Green,
+            ),
+            count_field(
+                if chinese { "输入" } else { "input" },
+                tier.tokens.input_tokens,
+                Color::White,
+            ),
+            count_field(
+                if chinese { "输出" } else { "output" },
+                tier.tokens.output_tokens,
+                Color::White,
+            ),
+        ];
+        println!(
+            "  {}{}{}",
+            paint(value, tier_color),
+            dim(if chinese { "：" } else { ": " }),
+            parts.join(&separator())
+        );
+    }
+    let price = &report.pricing;
+    println!(
+        "{}",
+        label(if chinese {
+            "OpenAI API 标准费率参考（USD，仅文本 Token）："
+        } else {
+            "OpenAI API Standard rate reference (USD, text tokens only):"
+        })
+    );
+    println!(
+        "  {}",
+        [
+            usd_field(
+                if chinese { "标准费用" } else { "Standard" },
+                &price.standard_usd
+            ),
+            field(
+                if chinese {
+                    "费率日期"
+                } else {
+                    "rates as of"
+                },
+                &price.as_of,
+                Color::Blue
+            ),
+            field(
+                if chinese { "已计价" } else { "priced" },
+                &format!("{} / {}", price.priced_responses, report.responses),
+                Color::Green
+            ),
+            count_field(
+                if chinese {
+                    "长上下文加价"
+                } else {
+                    "long context"
+                },
+                price.long_context_responses,
+                Color::Yellow
+            ),
+        ]
+        .join(&separator())
+    );
+    println!(
+        "{}",
+        label(if chinese {
+            "按精确模型 ID 计价："
+        } else {
+            "Pricing by exact model ID:"
+        })
+    );
+    for item in &price.models {
+        println!(
+            "  {}{}{}",
+            paint(&item.model, Color::Magenta),
+            dim(if chinese { "：" } else { ": " }),
+            [
+                count_field(
+                    if chinese { "响应" } else { "responses" },
+                    item.responses,
+                    Color::Green
+                ),
+                usd_field("Standard", &item.standard_usd),
+            ]
+            .join(&separator())
+        );
+    }
+    if price.unpriced_responses > 0 {
+        eprintln!(
+            "{}{}",
+            field(
+                if chinese { "未计价" } else { "unpriced" },
+                &price.unpriced_responses.to_string(),
+                Color::Red
+            ),
+            dim(if chinese {
+                "（费用不包含这些响应）："
+            } else {
+                " (excluded from USD total):"
+            })
+        );
+        for item in &price.unpriced {
+            eprintln!(
+                "  {}: {} ({})",
+                paint(&item.model, Color::Magenta),
+                paint(item.responses.to_string(), Color::Red),
+                dim(&item.reason)
+            );
+        }
+    }
+    if report.warning_count > 0 {
+        eprintln!(
+            "{}{}:",
+            label(if chinese {
+                "扫描警告"
+            } else {
+                "Scan warnings"
+            }),
+            paint(report.warning_count.to_string(), Color::Yellow)
+        );
+        for warning in &report.warnings {
+            eprintln!("  {}", paint(warning, Color::Yellow));
+        }
+        if report.warning_count > report.warnings.len() {
+            eprintln!(
+                "  ... ({} more)",
+                report.warning_count - report.warnings.len()
+            );
+        }
+    }
+    println!(
+        "{}",
+        dim(if chinese {
+            "注：标准 API 参考价非实际账单；未对无法验证的 Fast 执行 tier 加价。"
+        } else {
+            "Note: Standard API reference is not actual billing; no unverified Fast-tier surcharges."
+        })
+    );
 }
 
 fn maybe_print_localized_help() -> bool {
@@ -531,10 +1037,13 @@ fn print_ui_help(target: Option<&str>) {
             "导入一个 auth.json\n\n用法：cas import/input [路径]\n\n参数：\n  [路径]  auth.json 路径；不指定时导入当前 ~/.codex/auth.json\n\n选项：\n  -h, --help  显示帮助"
         ),
         "remove" | "delete" | "remove/delete" => println!(
-            "删除一个已保存账号\n\n用法：cas remove/delete [完整邮箱]\n\n参数：\n  [完整邮箱]  完整邮箱地址；同邮箱多个工作区时进入账号选择器\n\n选项：\n  -h, --help  显示帮助"
+            "删除一个已保存账号\n\n用法：cas remove/delete [完整邮箱]\n\n参数：\n  [完整邮箱]  完整邮箱地址；同邮箱多个账号ID时进入账号选择器\n\n行为：\n  当前生效 auth 在列表中标为锁定，删除前需再次交互确认。\n  确认后先关闭 Codex 进程，再删除当前 auth.json 及 CAS 中保存的对应账号；其他账号不受影响。\n  非交互终端不允许删除生效账号。\n\n选项：\n  -h, --help  显示帮助"
+        ),
+        "usage" | "price" | "usage/price" => println!(
+            "只读统计 Codex 本地 JSONL 用量及 API 等价美元费用\n\n用法：cas usage/price [路径] [--json]\n\n参数：\n  [路径]    可选 JSONL 文件或目录；默认扫描 CODEX_HOME/sessions 与 archived_sessions\n\n交互选择：\n  1d（今天）、24h、3d、7d、1m、all，或手动输入起始和终止日期。\n  手动编辑 yyyy/mm/dd/hh/mm，上下键切换，留空字段按当前时间填充。\n  --json 或重定向输出时不弹出选择页面，默认统计全部。\n\n行为：\n  仅精确匹配 GPT-5.2 至 GPT-6.1 官方模型 ID；支持缓存和长上下文。\n  按官方 2026-10-08 标准价格快照计价，不推断 Fast 实际执行 tier，非 ChatGPT 实际扣费。\n\n选项：\n  --json      输出逐响应 Token、计价和汇总 JSON\n  -h, --help  显示帮助"
         ),
         _ => println!(
-            "Codex 的 ChatGPT 账号切换器\n\n用法：cas [命令]\n\n命令：\n  login          登录 ChatGPT 账号\n  status         刷新凭据有效性和 Codex 剩余用量\n  test/refresh   并发测试所有账号的 gpt-6-luna 流式响应\n  switch/enable  结束 Codex 并切换账号\n  import/input   导入 auth.json\n  remove/delete  删除已保存账号\n  help           显示帮助\n\n选项：\n  -h, --help     显示帮助\n  -V, --version  显示版本"
+            "Codex 的 ChatGPT 账号切换器\n\n用法：cas [命令]\n\n命令：\n  login          登录 ChatGPT 账号\n  status         刷新凭据有效性和 Codex 剩余用量\n  test/refresh   并发测试所有账号的 gpt-6-luna 流式响应\n  switch/enable  结束 Codex 并切换账号\n  import/input   导入 auth.json\n  remove/delete  删除已保存账号\n  usage/price    只读统计本地 JSONL Token 消耗及 API 等价美元价格\n  help           显示帮助\n\n选项：\n  -h, --help     显示帮助\n  -V, --version  显示版本"
         ),
     }
 }
@@ -559,11 +1068,13 @@ fn select_matching_account(
     prompt: &str,
     accounts: Vec<AccountChoice>,
     selector: &str,
+    current: Option<&CurrentAccount>,
+    mode: AccountSelectionMode,
 ) -> cas_core::Result<Option<AccountChoice>> {
     match accounts.len() {
         0 => Err(CasError::AccountNotFound(selector.into())),
         1 => Ok(accounts.into_iter().next()),
-        _ => select_account(cas, prompt, &accounts),
+        _ => select_account(cas, prompt, &accounts, current, mode),
     }
 }
 
@@ -571,10 +1082,106 @@ fn select_account(
     cas: &Cas,
     prompt: &str,
     accounts: &[AccountChoice],
+    current: Option<&CurrentAccount>,
+    mode: AccountSelectionMode,
 ) -> cas_core::Result<Option<AccountChoice>> {
     let accounts = refresh_account_choices(cas, accounts)?;
-    let labels: Vec<_> = accounts.iter().map(format_account_choice).collect();
+    let labels: Vec<_> = accounts
+        .iter()
+        .map(|choice| format_account_choice_for_action(choice, current, mode))
+        .collect();
     Ok(select_menu(prompt, &labels, true)?.map(|index| accounts[index].clone()))
+}
+
+fn is_selected_active(choice: &AccountChoice, current: &CurrentAccount) -> bool {
+    current
+        .account
+        .as_ref()
+        .is_some_and(|active| active.id == choice.account.id)
+}
+
+fn format_account_choice_for_action(
+    choice: &AccountChoice,
+    current: Option<&CurrentAccount>,
+    mode: AccountSelectionMode,
+) -> String {
+    let is_active = current.is_some_and(|current| is_selected_active(choice, current));
+    if !is_active || mode == AccountSelectionMode::General {
+        return format_account_choice(choice);
+    }
+    let marker = if mode == AccountSelectionMode::Remove {
+        if zh() {
+            "[锁定·当前生效] "
+        } else {
+            "[LOCKED·ACTIVE] "
+        }
+    } else if zh() {
+        "[当前生效] "
+    } else {
+        "[ACTIVE] "
+    };
+
+    let mut active_choice = choice.clone();
+    if let Some(plan) = current.and_then(|current| current.plan_type.as_ref()) {
+        active_choice.auth_type = Some(plan.clone());
+    }
+    format!(
+        "{}{}",
+        paint(
+            marker,
+            if mode == AccountSelectionMode::Remove {
+                Color::Yellow
+            } else {
+                Color::Green
+            }
+        ),
+        format_account_choice(&active_choice)
+    )
+}
+
+fn confirm_active_removal(choice: &AccountChoice) -> cas_core::Result<bool> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(CasError::Verification(if zh() {
+            "删除当前生效账号必须在终端交互确认，以便先关闭 Codex。".into()
+        } else {
+            "deleting the active auth requires interactive terminal confirmation before shutting down Codex".into()
+        }));
+    }
+    let name = choice.account.display_name();
+    println!(
+        "{}",
+        paint(
+            if zh() {
+                "警告：所选 auth 正在生效；删除将关闭所有 Codex 进程，并移除当前 auth.json。"
+            } else {
+                "Warning: this auth is active; deletion stops all Codex processes and removes active auth.json."
+            },
+            Color::Yellow
+        )
+    );
+    let options = if zh() {
+        vec![
+            "取消，保留当前账号".to_owned(),
+            format!("关闭 Codex 并删除 {name}（同时退出当前账号）"),
+        ]
+    } else {
+        vec![
+            "Cancel; keep active account".to_owned(),
+            format!("Stop Codex and delete {name} (sign out)"),
+        ]
+    };
+    Ok(matches!(
+        select_menu(
+            if zh() {
+                "确认解锁并删除生效 auth"
+            } else {
+                "Confirm active auth deletion"
+            },
+            &options,
+            false,
+        )?,
+        Some(1)
+    ))
 }
 
 fn refresh_account_choices(
@@ -683,7 +1290,7 @@ fn format_account_choice(choice: &AccountChoice) -> String {
             )
         });
     let email = paint(email, Color::White);
-    let auth_type = paint(auth_type, Color::Blue);
+    let auth_type = field(if zh() { "套餐" } else { "plan" }, auth_type, Color::Blue);
     let refresh = dim(refresh);
     let workspace = paint(workspace, Color::Magenta);
     let refresh_field = format!(
@@ -694,7 +1301,7 @@ fn format_account_choice(choice: &AccountChoice) -> String {
     );
     let workspace_field = format!(
         "{}{}{}",
-        label(if zh() { "工作区" } else { "workspace" }),
+        label(if zh() { "账号ID" } else { "account ID" }),
         dim("="),
         workspace
     );
@@ -730,6 +1337,7 @@ fn select_main_action() -> cas_core::Result<Option<MainAction>> {
         (MainAction::Login, "login"),
         (MainAction::Input, "import/input"),
         (MainAction::Remove, "remove/delete"),
+        (MainAction::Usage, "usage/price"),
         (MainAction::Help, "help"),
     ];
     let labels: Vec<_> = ACTIONS
@@ -737,6 +1345,25 @@ fn select_main_action() -> cas_core::Result<Option<MainAction>> {
         .map(|(_, label)| (*label).to_owned())
         .collect();
     Ok(select_menu("CAS", &labels, false)?.map(|index| ACTIONS[index].0))
+}
+
+/// The same wrap-around navigation is used by every keyboard selector,
+/// including the manually edited usage date fields.
+fn cycle_selection(selected: usize, count: usize, up: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if up {
+        if selected == 0 {
+            count - 1
+        } else {
+            selected - 1
+        }
+    } else if selected == count - 1 {
+        0
+    } else {
+        selected + 1
+    }
 }
 
 fn select_menu(
@@ -804,8 +1431,8 @@ fn select_menu(
             return Ok(None);
         }
         match key.code {
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Down => selected = (selected + 1).min(item_count - 1),
+            KeyCode::Up => selected = cycle_selection(selected, item_count, true),
+            KeyCode::Down => selected = cycle_selection(selected, item_count, false),
             KeyCode::Enter => {
                 clear_selector(&mut stdout, displayed_rows)?;
                 return Ok(if with_exit {
@@ -897,7 +1524,7 @@ fn format_status(status: &AccountStatus) -> String {
     if zh() {
         let mut parts = vec![
             format!("{}{}", label("状态："), paint(email, Color::White)),
-            field("工作区", workspace, Color::Magenta),
+            field("账号ID", workspace, Color::Magenta),
             match status.snapshot.valid {
                 Some(true) => field("有效", "是", Color::Green),
                 Some(false) => field("有效", "否", Color::Red),
@@ -929,7 +1556,7 @@ fn format_status(status: &AccountStatus) -> String {
 
     let mut parts = vec![
         format!("{}{}", label("STATUS: "), paint(email, Color::White)),
-        field("workspace", workspace, Color::Magenta),
+        field("account ID", workspace, Color::Magenta),
         match status.snapshot.valid {
             Some(true) => field("valid", "yes", Color::Green),
             Some(false) => field("valid", "no", Color::Red),
@@ -1016,6 +1643,10 @@ fn format_current_auth(current: &cas_core::CurrentAccount) -> String {
                 .and_then(|account| account.account_id.as_deref())
         })
         .unwrap_or(if zh() { "未知" } else { "unknown" });
+    let plan = current
+        .plan_type
+        .as_deref()
+        .unwrap_or(if zh() { "未知" } else { "unknown" });
 
     if zh() {
         let unmanaged = if current.managed {
@@ -1024,11 +1655,13 @@ fn format_current_auth(current: &cas_core::CurrentAccount) -> String {
             "（未纳入 CAS）"
         };
         format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             label("当前 auth："),
             paint(name, Color::White),
             dim(" ["),
-            field("工作区", workspace, Color::Magenta),
+            field("账号ID", workspace, Color::Magenta),
+            separator(),
+            field("套餐", plan, Color::Blue),
             dim("]"),
             if unmanaged.is_empty() {
                 String::new()
@@ -1043,11 +1676,13 @@ fn format_current_auth(current: &cas_core::CurrentAccount) -> String {
             " (not managed by CAS)"
         };
         format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             label("active auth: "),
             paint(name, Color::White),
             dim(" ["),
-            field("workspace", workspace, Color::Magenta),
+            field("account ID", workspace, Color::Magenta),
+            separator(),
+            field("plan", plan, Color::Blue),
             dim("]"),
             if unmanaged.is_empty() {
                 String::new()
@@ -1073,7 +1708,7 @@ fn print_test_result(result: &cas_core::AccountTestResult) {
                 label("测试："),
                 paint(&name, Color::White),
                 separator(),
-                field("工作区", workspace, Color::Magenta),
+                field("账号ID", workspace, Color::Magenta),
                 separator(),
                 field("模型", "gpt-6-luna", Color::Blue),
                 separator(),
@@ -1086,7 +1721,7 @@ fn print_test_result(result: &cas_core::AccountTestResult) {
                 label("TEST: "),
                 paint(&name, Color::White),
                 separator(),
-                field("workspace", workspace, Color::Magenta),
+                field("account ID", workspace, Color::Magenta),
                 separator(),
                 field("model", "gpt-6-luna", Color::Blue),
                 separator(),
@@ -1108,7 +1743,7 @@ fn print_test_result(result: &cas_core::AccountTestResult) {
             label("测试："),
             paint(&name, Color::White),
             separator(),
-            field("工作区", workspace, Color::Magenta),
+            field("账号ID", workspace, Color::Magenta),
             separator(),
             field("模型", "gpt-6-luna", Color::Blue),
             separator(),
@@ -1122,7 +1757,7 @@ fn print_test_result(result: &cas_core::AccountTestResult) {
             label("TEST: "),
             paint(&name, Color::White),
             separator(),
-            field("workspace", workspace, Color::Magenta),
+            field("account ID", workspace, Color::Magenta),
             separator(),
             field("model", "gpt-6-luna", Color::Blue),
             separator(),
@@ -1150,9 +1785,13 @@ fn print_test_result(result: &cas_core::AccountTestResult) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, format_account_choice, menu_rendered_rows, usage_color, visible_width, zh,
+        AccountSelectionMode, Cli, Command, cycle_selection, format_account_choice,
+        format_account_choice_for_action, format_current_auth, is_selected_active,
+        menu_rendered_rows, usage_color, visible_width, zh,
     };
-    use cas_core::{AccountChoice, AccountRecord, AccountStatusSnapshot, UsageWindow};
+    use cas_core::{
+        AccountChoice, AccountRecord, AccountStatusSnapshot, CurrentAccount, UsageWindow,
+    };
     use clap::Parser;
     use crossterm::style::Color;
 
@@ -1186,7 +1825,24 @@ mod tests {
     }
 
     #[test]
-    fn account_choice_includes_workspace_plan_and_refresh() {
+    fn all_selectors_cycle_from_first_to_last_and_last_to_first() {
+        // Includes menus with an extra "不做更改" row and short lists.
+        for count in [1, 2, 3, 6, 7, 8, 25] {
+            assert_eq!(cycle_selection(0, count, true), count - 1);
+            assert_eq!(cycle_selection(count - 1, count, false), 0);
+            for selected in 1..count {
+                assert_eq!(cycle_selection(selected, count, true), selected - 1);
+            }
+            for selected in 0..count - 1 {
+                assert_eq!(cycle_selection(selected, count, false), selected + 1);
+            }
+        }
+        assert_eq!(cycle_selection(0, 0, true), 0);
+        assert_eq!(cycle_selection(0, 0, false), 0);
+    }
+
+    #[test]
+    fn account_choice_includes_account_id_plan_and_refresh() {
         let choice = AccountChoice {
             account: AccountRecord {
                 id: "00000000-0000-0000-0000-000000000001".into(),
@@ -1225,14 +1881,70 @@ mod tests {
         if zh() {
             assert!(label.contains("5小时=88%"));
             assert!(label.contains("周=53%"));
-            assert!(label.contains("工作区=workspace-business"));
+            assert!(label.contains("账号ID=workspace-business"));
             assert!(label.contains("凭据=2025-09-26"));
         } else {
             assert!(label.contains("5h=88%"));
             assert!(label.contains("week=53%"));
-            assert!(label.contains("workspace=workspace-business"));
+            assert!(label.contains("account ID=workspace-business"));
             assert!(label.contains("token=2025-09-26"));
         }
+    }
+
+    #[test]
+    fn switch_and_delete_mark_only_the_actual_active_account_and_show_its_plan() {
+        let choice = AccountChoice {
+            account: AccountRecord {
+                id: "account-business".into(),
+                alias: None,
+                email: Some("same@example.com".into()),
+                account_id: Some("shared-workspace".into()),
+                user_id: Some("user-business".into()),
+                created_at: 0,
+                updated_at: 0,
+                last_activated_at: None,
+                last_status: None,
+            },
+            token_last_refresh_millis: None,
+            auth_type: None,
+        };
+        let current = CurrentAccount {
+            account: Some(choice.account.clone()),
+            identity: Some(choice.account.identity()),
+            managed: true,
+            plan_type: Some("business".into()),
+        };
+        let active_label = format_current_auth(&current);
+        assert!(active_label.contains("same@example.com"));
+        assert!(active_label.contains(if zh() { "套餐" } else { "plan" }));
+        assert!(active_label.contains("business"));
+
+        assert!(is_selected_active(&choice, &current));
+        let switch_label =
+            format_account_choice_for_action(&choice, Some(&current), AccountSelectionMode::Switch);
+        assert!(switch_label.contains(if zh() { "[当前生效]" } else { "[ACTIVE]" }));
+        assert!(switch_label.contains("business"));
+        let remove_label =
+            format_account_choice_for_action(&choice, Some(&current), AccountSelectionMode::Remove);
+        assert!(remove_label.contains(if zh() {
+            "[锁定·当前生效]"
+        } else {
+            "[LOCKED·ACTIVE]"
+        }));
+        assert!(remove_label.contains("business"));
+
+        // A second account can share its email/workspace but differ by user.
+        // Only the exact saved account ID receives the active/locked marker.
+        let mut other = choice;
+        other.account.id = "account-free".into();
+        other.account.user_id = Some("user-free".into());
+        other.auth_type = Some("free".into());
+        assert!(!is_selected_active(&other, &current));
+        let remove_other =
+            format_account_choice_for_action(&other, Some(&current), AccountSelectionMode::Remove);
+        assert!(!remove_other.contains("[锁定"));
+        assert!(!remove_other.contains("[LOCKED"));
+        assert!(remove_other.contains("free"));
     }
 
     #[test]
@@ -1297,5 +2009,20 @@ mod tests {
     fn bare_cas_parses_without_a_subcommand() {
         let cli = Cli::try_parse_from(["cas"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn usage_price_aliases_accept_optional_path_and_json() {
+        for command in ["usage", "price", "usage/price"] {
+            let cli =
+                Cli::try_parse_from(["cas", command, "--json", "/tmp/rollout.jsonl"]).unwrap();
+            match cli.command {
+                Some(Command::Usage { path, json }) => {
+                    assert_eq!(path.unwrap(), std::path::Path::new("/tmp/rollout.jsonl"));
+                    assert!(json);
+                }
+                _ => panic!("{command} did not parse as usage"),
+            }
+        }
     }
 }

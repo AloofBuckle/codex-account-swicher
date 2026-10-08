@@ -15,10 +15,15 @@ pub struct CasPaths {
 
 impl CasPaths {
     pub fn discover() -> Result<Self> {
-        let home = dirs::home_dir().ok_or(CasError::HomeUnavailable)?;
         let codex_home = std::env::var_os("CODEX_HOME")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".codex"));
+            .map(Ok)
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .map(|home| home.join(".codex"))
+                    .ok_or(CasError::HomeUnavailable)
+            })?;
         Ok(Self::from_codex_home(codex_home))
     }
 

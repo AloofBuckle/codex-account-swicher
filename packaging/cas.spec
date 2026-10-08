@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           cas
-Version:        0.1.28
+Version:        0.1.34
 Release:        1%{?dist}
 Summary:        ChatGPT account switcher for Codex
 License:        Unlicense
@@ -25,6 +25,39 @@ install -Dpm0644 %{SOURCE1} %{buildroot}%{_licensedir}/%{name}/LICENSE
 %license %{_licensedir}/%{name}/LICENSE
 
 %changelog
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.34-1
+- Display the actual active auth and its plan in switch and delete selectors
+- Highlight the active account; mark the active delete row as protected
+- Require explicit confirmation to stop Codex before deleting active auth
+- Remove the active auth.json and saved credential together, clearing active state
+- Keep non-active deletion unchanged and block active deletion in non-TTY mode
+
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.33-1
+- Wrap all CLI selector arrow-key navigation from the first row to the last
+- Apply the same wrap-around behavior to manual usage date field selection
+- Preserve Enter confirmation, Esc cancellation, and inline terminal redraw
+
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.32-1
+- Use the existing inline account-selector style for usage date ranges
+- Show presets in one vertical list with arrow-key selection and manual entry
+- Keep manual start/end fields inline without alternate-screen or full-screen clear
+
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.31-1
+- Add keyboard-driven usage time-range picker: 1d, 24h, 3d, 7d, 1m, all
+- Add two-page manual start/end date editor with yyyy/mm/dd/hh/mm fields
+- Filter token and price aggregations by per-response timestamp in local time
+- Keep --json and noninteractive scans compatible with previous all-time behavior
+
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.30-1
+- Color local usage/price fields and values consistently with account status
+- Remove speculative requested-tier USD charges and JSON fields
+- Keep Standard API reference pricing and the logged request-tier breakdown
+
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.29-1
+- Add local read-only Codex JSONL usage and API-equivalent USD price estimates
+- Match GPT-5.2 through GPT-6.1 model IDs exactly, with cache and long-context pricing
+- Report requested Fast tier separately from unobserved server-executed tier
+
 * Fri Oct 02 2026 CAS Project <cas@localhost> - 0.1.28-1
 - Add concurrent test/refresh command for all saved ChatGPT credentials
 - Send a clean streaming hello to gpt-6-luna at the lowest advertised reasoning effort

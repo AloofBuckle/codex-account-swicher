@@ -174,8 +174,17 @@ pub struct SwitchResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct RemoveActiveResult {
+    pub account: AccountRecord,
+    pub terminated_processes: Vec<ProcessInfo>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CurrentAccount {
     pub account: Option<AccountRecord>,
     pub identity: Option<AuthIdentity>,
     pub managed: bool,
+    /// Plan from the actual active auth.json token, falling back to the last
+    /// saved account status only when the active credential lacks a plan.
+    pub plan_type: Option<String>,
 }

@@ -13,5 +13,6 @@ cas-core = { path = "../cas-core" }
 chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+serde_json.workspace = true
 webbrowser.workspace = true
 unicode-width.workspace = true

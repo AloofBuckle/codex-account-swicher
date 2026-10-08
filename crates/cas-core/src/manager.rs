@@ -10,8 +10,8 @@ use crate::remote::{
 };
 use crate::{
     AccountChoice, AccountRecord, AccountStatus, AccountStatusSnapshot, AccountTestResult,
-    AuthIdentity, BrowserLogin, CasError, CasPaths, CurrentAccount, DeviceLogin, Registry, Result,
-    SwitchResult,
+    AuthIdentity, BrowserLogin, CasError, CasPaths, CurrentAccount, DeviceLogin, ProcessInfo,
+    Registry, RemoveActiveResult, Result, SwitchResult,
 };
 use fs2::FileExt;
 use std::collections::HashSet;
@@ -151,6 +151,7 @@ impl Cas {
                 account: None,
                 identity: None,
                 managed: false,
+                plan_type: None,
             });
         }
         let bytes = self.read_stable_active_auth()?;
@@ -170,10 +171,21 @@ impl Cas {
                     .and_then(|id| registry.accounts.iter().find(|a| a.id == id).cloned())
             }
         });
+        let plan_type = auth_plan_type(&bytes).or_else(|| {
+            account
+                .as_ref()
+                .and_then(|a| a.last_status.as_ref())
+                .and_then(|s| s.plan_type.as_ref())
+                .map(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "team" => "business".to_owned(),
+                    _ => s.trim().to_ascii_lowercase(),
+                })
+        });
         Ok(CurrentAccount {
             managed: account.is_some(),
             account,
             identity: Some(identity),
+            plan_type,
         })
     }
 
@@ -534,6 +546,104 @@ impl Cas {
         self.remove_impl(id, true)
     }
 
+    /// Delete the account that is *actually* active, but only after the caller
+    /// explicitly confirms it. Unlike `remove_id`, this shuts down Codex and
+    /// removes both the active auth.json and the saved CAS credential.
+    /// A second identity check under the state lock prevents deleting an auth
+    /// that was switched between displaying the menu and accepting the prompt.
+    pub fn remove_active_id(&self, id: &str) -> Result<RemoveActiveResult> {
+        self.remove_active_id_with_shutdown(id, terminate_all_codex, ensure_no_codex_processes)
+    }
+
+    // Inject the process shutdown hooks in tests so tests never terminate
+    // unrelated user Codex instances. Production always invokes the real
+    // shutdown and verification functions above.
+    fn remove_active_id_with_shutdown<F, C>(
+        &self,
+        id: &str,
+        shutdown: F,
+        check_stopped: C,
+    ) -> Result<RemoveActiveResult>
+    where
+        F: FnOnce() -> Result<Vec<ProcessInfo>>,
+        C: Fn() -> Result<()>,
+    {
+        let _lock = self.lock()?;
+        self.ensure_file_credential_store()?;
+        let mut registry = self.load_registry_reconciled()?;
+        let target = resolve_id_exact(&registry, id)?.clone();
+
+        let before = self.read_stable_active_auth()?;
+        let identity = validate_auth(&before)?;
+        if !identities_match(&target.identity(), &identity) {
+            return Err(CasError::Verification(
+                "selected account is no longer the active auth; refusing privileged removal".into(),
+            ));
+        }
+        // Validate removable storage BEFORE closing Codex, so an unsafe
+        // account directory does not unnecessarily stop the user's session.
+        self.check_removable_account_storage(&target.id)?;
+
+        let terminated_processes = shutdown()?;
+        check_stopped()?;
+
+        // Codex may have refreshed the active auth during shutdown. Validate
+        // the final credential once more and retain its bytes for rollback.
+        let active_bytes = self.read_stable_active_auth()?;
+        let active_identity = validate_auth(&active_bytes)?;
+        if !identities_match(&target.identity(), &active_identity) {
+            return Err(CasError::Verification(
+                "active auth changed during Codex shutdown; refusing to delete it".into(),
+            ));
+        }
+        let saved_path = self.paths.account_auth_path(&target.id);
+        let saved_bytes = if saved_path.exists() {
+            Some(std::fs::read(&saved_path)?)
+        } else {
+            None
+        };
+        self.check_removable_account_storage(&target.id)?;
+        check_stopped()?;
+
+        // A deletion of an active slot must remove auth.json itself; leaving
+        // it behind would silently keep the supposedly deleted login active.
+        // Deleting the CAS slot first lets us restore it from the captured
+        // bytes if unlinking the active auth.json fails.
+        self.remove_account_storage(&target.id)?;
+        if let Err(error) = std::fs::remove_file(&self.paths.codex_auth_path) {
+            self.restore_removed_account(&target.id, saved_bytes.as_deref())?;
+            return Err(error.into());
+        }
+
+        registry.accounts.retain(|account| account.id != target.id);
+        registry.active_account_id = None;
+        registry.updated_at = chrono::Utc::now().timestamp();
+        if let Err(error) = self.save_registry(&registry) {
+            // Preserve login and registry consistency on I/O failures.
+            self.restore_removed_account(&target.id, saved_bytes.as_deref())?;
+            atomic_write(&self.paths.codex_auth_path, &active_bytes)?;
+            return Err(error);
+        }
+
+        Ok(RemoveActiveResult {
+            account: target,
+            terminated_processes,
+        })
+    }
+
+    fn restore_removed_account(&self, id: &str, saved: Option<&[u8]>) -> Result<()> {
+        if let Some(bytes) = saved {
+            self.paths.ensure_account_dir(id)?;
+            let path = self.paths.account_auth_path(id);
+            atomic_write(&path, bytes)?;
+            verify_bytes(&path, bytes)?;
+        } else if self.paths.account_dir(id).exists() {
+            // A previously missing CAS slot must remain missing after rollback.
+            self.remove_account_storage(id)?;
+        }
+        Ok(())
+    }
+
     fn remove_impl(&self, selector: &str, exact_id: bool) -> Result<AccountRecord> {
         let _lock = self.lock()?;
         let mut registry = self.load_registry_reconciled()?;
@@ -562,11 +672,26 @@ impl Cas {
     }
 
     fn remove_account_storage(&self, id: &str) -> Result<()> {
+        if !self.check_removable_account_storage(id)? {
+            return Ok(());
+        }
+        let dir = self.paths.account_dir(id);
+        let auth_path = dir.join("auth.json");
+        match std::fs::remove_file(&auth_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::remove_dir(&dir)?;
+        Ok(())
+    }
+
+    fn check_removable_account_storage(&self, id: &str) -> Result<bool> {
         validate_account_id(id)?;
         let dir = self.paths.account_dir(id);
         let metadata = match std::fs::symlink_metadata(&dir) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -586,14 +711,7 @@ impl Cas {
             }
         }
 
-        let auth_path = dir.join("auth.json");
-        match std::fs::remove_file(&auth_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        std::fs::remove_dir(&dir)?;
-        Ok(())
+        Ok(true)
     }
 
     fn capture_current_after_shutdown(
@@ -1614,6 +1732,164 @@ mod tests {
         let registry = cas.load_registry().unwrap();
         assert!(resolve_email_exact(&registry, "alp").is_err());
         assert!(resolve_email_exact(&registry, "ALPHA@example.com").is_ok());
+    }
+
+    fn auth_with_plan(email: &str, account_id: &str, plan: &str) -> Vec<u8> {
+        let mut root: serde_json::Value = serde_json::from_slice(&auth(email, account_id)).unwrap();
+        root["tokens"]["id_token"]["https://api.openai.com/auth"] =
+            serde_json::json!({"chatgpt_plan_type": plan});
+        serde_json::to_vec(&root).unwrap()
+    }
+
+    #[test]
+    fn current_auth_plan_is_read_from_the_active_token() {
+        let (_app, codex, cas) = cas();
+        std::fs::write(
+            codex.path().join("auth.json"),
+            auth_with_plan("active@example.com", "workspace-active", "team"),
+        )
+        .unwrap();
+        let saved = cas.import_current(None).unwrap();
+        let current = cas.current_account().unwrap();
+        assert!(current.managed);
+        assert_eq!(current.account.as_ref().unwrap().id, saved.id);
+        assert_eq!(current.plan_type.as_deref(), Some("business"));
+        assert_eq!(
+            cas.account_choices().unwrap()[0].auth_type.as_deref(),
+            Some("business")
+        );
+    }
+
+    #[test]
+    fn active_removal_requires_explicit_path_then_clears_active_and_saved_auth() {
+        use std::cell::Cell;
+
+        let (_app, codex, cas) = cas();
+        let active_auth = auth_with_plan("active@example.com", "workspace-active", "team");
+        std::fs::write(codex.path().join("auth.json"), &active_auth).unwrap();
+        let active = cas.import_current(None).unwrap();
+
+        let other_file = codex.path().join("other-auth.json");
+        std::fs::write(&other_file, auth("other@example.com", "workspace-other")).unwrap();
+        let inactive = cas.input(Some(&other_file)).unwrap();
+        assert!(matches!(
+            cas.remove_id(&active.id),
+            Err(CasError::ActiveAccountRemoval)
+        ));
+
+        // A privileged delete may only target the *actual* active identity,
+        // not another account (even if the caller deliberately passes its ID).
+        assert!(matches!(
+            cas.remove_active_id_with_shutdown(
+                &inactive.id,
+                || panic!("must not shut down processes for a non-active target"),
+                || Ok(())
+            ),
+            Err(CasError::Verification(_))
+        ));
+        assert!(cas.paths.codex_auth_path.exists());
+
+        let shutdowns = Cell::new(0);
+        let verifications = Cell::new(0);
+        let result = cas
+            .remove_active_id_with_shutdown(
+                &active.id,
+                || {
+                    shutdowns.set(shutdowns.get() + 1);
+                    Ok(vec![ProcessInfo {
+                        pid: 1234,
+                        name: "codex".into(),
+                    }])
+                },
+                || {
+                    verifications.set(verifications.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(result.account.id, active.id);
+        assert_eq!(result.terminated_processes.len(), 1);
+        assert_eq!(shutdowns.get(), 1);
+        assert_eq!(verifications.get(), 2);
+        assert!(!cas.paths.codex_auth_path.exists());
+        assert!(!cas.paths.account_dir(&active.id).exists());
+        assert!(cas.paths.account_auth_path(&inactive.id).exists());
+        assert!(cas.load_registry().unwrap().active_account_id.is_none());
+        assert_eq!(cas.list_accounts().unwrap().len(), 1);
+        assert_eq!(cas.current_account().unwrap().identity, None);
+    }
+
+    #[test]
+    fn active_removal_does_not_modify_credentials_when_shutdown_fails() {
+        let (_app, codex, cas) = cas();
+        let auth_bytes = auth("active@example.com", "workspace-active");
+        std::fs::write(codex.path().join("auth.json"), &auth_bytes).unwrap();
+        let saved = cas.import_current(None).unwrap();
+        assert!(matches!(
+            cas.remove_active_id_with_shutdown(
+                &saved.id,
+                || Err(CasError::CodexStillRunning(vec![ProcessInfo {
+                    pid: 4242,
+                    name: "codex".into(),
+                }])),
+                || panic!("shutdown failed; no later check is allowed")
+            ),
+            Err(CasError::CodexStillRunning(_))
+        ));
+        assert_eq!(
+            std::fs::read(&cas.paths.codex_auth_path).unwrap(),
+            auth_bytes
+        );
+        assert!(cas.paths.account_auth_path(&saved.id).exists());
+        assert_eq!(
+            cas.load_registry().unwrap().active_account_id,
+            Some(saved.id)
+        );
+    }
+
+    #[test]
+    fn active_removal_preflights_storage_and_rechecks_auth_after_shutdown() {
+        let (_app, codex, cas) = cas();
+        let auth_bytes = auth("active@example.com", "workspace-active");
+        std::fs::write(codex.path().join("auth.json"), &auth_bytes).unwrap();
+        let saved = cas.import_current(None).unwrap();
+
+        let unexpected = cas.paths.account_dir(&saved.id).join("unexpected");
+        std::fs::write(&unexpected, b"keep").unwrap();
+        assert!(matches!(
+            cas.remove_active_id_with_shutdown(
+                &saved.id,
+                || panic!("invalid account directory must fail before shutdown"),
+                || Ok(())
+            ),
+            Err(CasError::Verification(message)) if message.contains("unexpected")
+        ));
+        assert!(unexpected.exists());
+        std::fs::remove_file(&unexpected).unwrap();
+
+        // Simulate a credential being switched to another account during the
+        // shutdown; the post-shutdown identity recheck must prevent deletion.
+        let other = auth("other@example.com", "workspace-other");
+        assert!(matches!(
+            cas.remove_active_id_with_shutdown(
+                &saved.id,
+                || {
+                    std::fs::write(&cas.paths.codex_auth_path, &other)?;
+                    Ok(Vec::new())
+                },
+                || Ok(())
+            ),
+            Err(CasError::Verification(message)) if message.contains("during Codex shutdown")
+        ));
+        assert_eq!(std::fs::read(&cas.paths.codex_auth_path).unwrap(), other);
+        assert!(cas.paths.account_auth_path(&saved.id).exists());
+        assert!(
+            cas.load_registry()
+                .unwrap()
+                .accounts
+                .iter()
+                .any(|a| a.id == saved.id)
+        );
     }
 
     #[test]
