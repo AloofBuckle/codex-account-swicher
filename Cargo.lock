@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "cas-cli"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "cas-core",
  "chrono",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "cas-core"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "atomic-write-file",
  "base64 0.22.1",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "cas-gui"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "cas-core",
  "gpui",

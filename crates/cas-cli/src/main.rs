@@ -151,6 +151,14 @@ fn format_cache_hit_rate(cached: u64, input: u64) -> String {
 #[derive(Debug, Parser)]
 #[command(name = "cas", version, about = "ChatGPT Account Switcher for Codex")]
 struct Cli {
+    /// Compact usage token counts and hide per-model details (default).
+    /// With no subcommand, keep this mode for usage selected from the CAS menu.
+    #[arg(long, global = true, conflicts_with = "detailed")]
+    summary: bool,
+    /// Show exact usage token counts, per-model breakdowns and warnings.
+    /// With no subcommand, keep this mode for usage selected from the CAS menu.
+    #[arg(long, global = true)]
+    detailed: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -196,12 +204,6 @@ enum Command {
         /// Print structured statistics, including per-response data, as JSON.
         #[arg(long)]
         json: bool,
-        /// Compact token numbers and show only aggregate totals (default).
-        #[arg(long, conflicts_with = "detailed")]
-        summary: bool,
-        /// Show exact tokens, per-model breakdowns and scan warnings.
-        #[arg(long)]
-        detailed: bool,
     },
 }
 
@@ -262,6 +264,13 @@ fn main() {
 }
 
 fn run(cli: Cli) -> cas_core::Result<()> {
+    // Global flags survive the main-menu selection. `cas --detailed` opens
+    // the usual CAS menu, and selecting usage retains Detailed mode.
+    let mode = match (cli.summary, cli.detailed) {
+        (false, true) => UsageDisplayMode::Detailed,
+        (false, false) | (true, false) => UsageDisplayMode::Summary,
+        (true, true) => unreachable!("Clap prevents --summary with --detailed"),
+    };
     let command = match cli.command {
         Some(command) => command,
         None => {
@@ -278,8 +287,6 @@ fn run(cli: Cli) -> cas_core::Result<()> {
                 MainAction::Usage => Command::Usage {
                     path: None,
                     json: false,
-                    summary: false,
-                    detailed: false,
                 },
                 MainAction::Help => {
                     print_ui_help(None);
@@ -291,13 +298,7 @@ fn run(cli: Cli) -> cas_core::Result<()> {
 
     // Usage is intentionally self-contained and read-only: do not require an
     // auth.json, create CAS state directories, or contact the Codex service.
-    if let Command::Usage {
-        path,
-        json,
-        summary: _,
-        detailed,
-    } = &command
-    {
+    if let Command::Usage { path, json } = &command {
         let paths = CasPaths::discover()?;
         // Scripts and --json retain the previous noninteractive all-time
         // behavior. On a terminal the selection UI runs before scanning.
@@ -314,14 +315,7 @@ fn run(cli: Cli) -> cas_core::Result<()> {
         if *json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            print_local_usage(
-                &report,
-                if *detailed {
-                    UsageDisplayMode::Detailed
-                } else {
-                    UsageDisplayMode::Summary
-                },
-            );
+            print_local_usage(&report, mode);
         }
         return Ok(());
     }
@@ -1243,8 +1237,9 @@ fn maybe_print_localized_help() -> bool {
         .any(|arg| arg == "-h" || arg == "--help")
     {
         let target = args
-            .get(1)
-            .filter(|arg| arg.as_str() != "-h" && arg.as_str() != "--help")
+            .iter()
+            .skip(1)
+            .find(|arg| !matches!(arg.as_str(), "-h" | "--help" | "--summary" | "--detailed"))
             .map(String::as_str);
         if target.is_some_and(|name| !is_known_help_target(name)) {
             return false;
@@ -1311,10 +1306,10 @@ fn print_ui_help(target: Option<&str>) {
             "删除一个已保存账号\n\n用法：cas remove [完整邮箱] 或 cas delete [完整邮箱]\n\n参数：\n  [完整邮箱]  完整邮箱地址；同邮箱多个账号ID时进入账号选择器\n\n行为：\n  当前生效 auth 在列表中标为锁定，删除前需再次交互确认。\n  确认后先关闭 Codex 进程，再删除当前 auth.json 及 CAS 中保存的对应账号；其他账号不受影响。\n  非交互终端不允许删除生效账号。\n\n选项：\n  -h, --help  显示帮助"
         ),
         "usage" | "cost" | "price" => println!(
-            "只读统计 Codex 本地 JSONL 用量及 API 等价美元费用\n\n用法：cas usage [路径] [--summary|--detailed] [--json]\n      cas cost [路径] [--summary|--detailed] [--json]\n      cas price [路径] [--summary|--detailed] [--json]\n\n参数：\n  [路径]    可选 JSONL 文件或目录；默认扫描 CODEX_HOME/sessions 与 archived_sessions\n\n交互选择：\n  1d（今天）、24h、3d、7d、1m、all，或手动输入起始和终止日期。\n  手动编辑 yyyy/mm/dd/hh/mm，上下键切换，留空字段按当前时间填充。\n  --json 或重定向输出时不弹出选择页面，默认统计全部。\n\n行为：\n  不指定格式时默认 --summary：Token 使用 K/M/B 简写，隐藏按模型用量、模型分价与扫描警告。\n  --detailed：显示原始完整 Token 数量、按模型详情和所有扫描警告。\n  --json：保留全部精确数值及警告，不受显示格式参数影响。\n  仅精确匹配 GPT-5.2 至 GPT-6.1 官方模型 ID；支持缓存和长上下文。\n  按官方 2026-10-08 标准价格快照计价，不推断 Fast 实际执行 tier，非 ChatGPT 实际扣费。\n\n选项：\n  --summary   紧凑显示汇总数据（默认）\n  --detailed  显示完整用量、分价和警告，与 --summary 互斥\n  --json      输出逐响应 Token、计价和汇总 JSON\n  -h, --help  显示帮助"
+            "只读统计 Codex 本地 JSONL 用量及 API 等价美元费用\n\n用法：cas usage [路径] [--summary|--detailed] [--json]\n      cas cost [路径] [--summary|--detailed] [--json]\n      cas price [路径] [--summary|--detailed] [--json]\n      cas [--summary|--detailed]（先进入主菜单，再选择 usage）\n\n参数：\n  [路径]    可选 JSONL 文件或目录；默认扫描 CODEX_HOME/sessions 与 archived_sessions\n\n交互选择：\n  1d（今天）、24h、3d、7d、1m、all，或手动输入起始和终止日期。\n  手动编辑 yyyy/mm/dd/hh/mm，上下键切换，留空字段按当前时间填充。\n  --json 或重定向输出时不弹出选择页面，默认统计全部。\n\n行为：\n  不指定格式时默认 --summary：Token 使用 K/M/B 简写，隐藏按模型用量、模型分价与扫描警告。\n  --detailed：显示原始完整 Token 数量、按模型详情和所有扫描警告。\n  --json：保留全部精确数值及警告，不受显示格式参数影响。\n  仅精确匹配 GPT-5.2 至 GPT-6.1 官方模型 ID；支持缓存和长上下文。\n  按官方 2026-10-08 标准价格快照计价，不推断 Fast 实际执行 tier，非 ChatGPT 实际扣费。\n\n选项：\n  --summary   紧凑显示汇总数据（默认），也可放在 cas 主菜单入口\n  --detailed  显示完整用量、分价和警告，与 --summary 互斥\n  --json      输出逐响应 Token、计价和汇总 JSON\n  -h, --help  显示帮助"
         ),
         _ => println!(
-            "Codex 的 ChatGPT 账号切换器\n\n用法：cas [命令]\n\n命令（每个名字单独使用）：\n  login                登录 ChatGPT 账号\n  status               刷新凭据有效性和 Codex 剩余用量\n  test、refresh         并发测试所有账号的 gpt-6-luna 流式响应\n  switch、enable        结束 Codex 并切换账号\n  import、input         导入 auth.json\n  remove、delete        删除已保存账号\n  usage、cost、price     只读统计本地 JSONL Token 消耗及 API 等价美元价格\n  help                 显示帮助\n\n选项：\n  -h, --help           显示帮助\n  -V, --version        显示版本"
+            "Codex 的 ChatGPT 账号切换器\n\n用法：cas [--summary|--detailed] [命令]\n\n命令（每个名字单独使用）：\n  login                登录 ChatGPT 账号\n  status               刷新凭据有效性和 Codex 剩余用量\n  test、refresh         并发测试所有账号的 gpt-6-luna 流式响应\n  switch、enable        结束 Codex 并切换账号\n  import、input         导入 auth.json\n  remove、delete        删除已保存账号\n  usage、cost、price     只读统计本地 JSONL Token 消耗及 API 等价美元价格\n  help                 显示帮助\n\n选项：\n  --summary            用量概要模式（默认，可带入主菜单）\n  --detailed           用量详细模式（可带入主菜单）\n  -h, --help           显示帮助\n  -V, --version        显示版本"
         ),
     }
 }
@@ -2281,6 +2276,8 @@ mod tests {
     fn bare_cas_parses_without_a_subcommand() {
         let cli = Cli::try_parse_from(["cas"]).unwrap();
         assert!(cli.command.is_none());
+        assert!(!cli.summary);
+        assert!(!cli.detailed);
     }
 
     #[test]
@@ -2289,65 +2286,51 @@ mod tests {
             let cli =
                 Cli::try_parse_from(["cas", command, "--json", "/tmp/rollout.jsonl"]).unwrap();
             match cli.command {
-                Some(Command::Usage {
-                    path,
-                    json,
-                    summary,
-                    detailed,
-                }) => {
+                Some(Command::Usage { path, json }) => {
                     assert_eq!(path.unwrap(), std::path::Path::new("/tmp/rollout.jsonl"));
                     assert!(json);
-                    assert!(!summary);
-                    assert!(!detailed);
                 }
                 _ => panic!("{command} did not parse as usage"),
             }
+            assert!(!cli.summary);
+            assert!(!cli.detailed);
         }
     }
 
     #[test]
-    fn usage_display_flags_default_to_summary_and_are_consistent_across_aliases() {
+    fn usage_display_flags_work_before_or_after_each_alias_and_at_main_menu() {
         for name in ["usage", "cost", "price"] {
-            let parse = |extra: &[&str]| {
-                let mut argv = vec!["cas", name];
-                argv.extend_from_slice(extra);
-                Cli::try_parse_from(argv).unwrap()
-            };
-            assert!(matches!(
-                parse(&[]).command,
-                Some(Command::Usage {
-                    summary: false,
-                    detailed: false,
-                    ..
-                })
-            ));
-            assert!(matches!(
-                parse(&["--summary"]).command,
-                Some(Command::Usage {
-                    summary: true,
-                    detailed: false,
-                    ..
-                })
-            ));
-            assert!(matches!(
-                parse(&["--detailed"]).command,
-                Some(Command::Usage {
-                    summary: false,
-                    detailed: true,
-                    ..
-                })
-            ));
+            for arguments in [
+                vec!["cas", "--detailed", name],
+                vec!["cas", name, "--detailed"],
+            ] {
+                let cli = Cli::try_parse_from(arguments).unwrap();
+                assert!(cli.detailed);
+                assert!(!cli.summary);
+                assert!(matches!(cli.command, Some(Command::Usage { .. })));
+            }
+            let cli = Cli::try_parse_from(["cas", name]).unwrap();
+            assert!(!cli.summary);
+            assert!(!cli.detailed);
+            let cli = Cli::try_parse_from(["cas", name, "--summary"]).unwrap();
+            assert!(cli.summary);
+            assert!(!cli.detailed);
             // JSON remains complete and machine-readable in either mode.
+            let cli = Cli::try_parse_from(["cas", "--detailed", name, "--json"]).unwrap();
+            assert!(cli.detailed);
             assert!(matches!(
-                parse(&["--json", "--detailed"]).command,
-                Some(Command::Usage {
-                    json: true,
-                    detailed: true,
-                    ..
-                })
+                cli.command,
+                Some(Command::Usage { json: true, .. })
             ));
             assert!(Cli::try_parse_from(["cas", name, "--summary", "--detailed"]).is_err());
         }
+        for (flag, summary, detailed) in [("--summary", true, false), ("--detailed", false, true)] {
+            let cli = Cli::try_parse_from(["cas", flag]).unwrap();
+            assert!(cli.command.is_none(), "must open CAS main menu");
+            assert_eq!(cli.summary, summary);
+            assert_eq!(cli.detailed, detailed);
+        }
+        assert!(Cli::try_parse_from(["cas", "--summary", "--detailed"]).is_err());
     }
 
     #[test]

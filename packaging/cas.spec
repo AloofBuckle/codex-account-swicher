@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           cas
-Version:        0.1.37
+Version:        0.1.38
 Release:        1%{?dist}
 Summary:        ChatGPT account switcher for Codex
 License:        Unlicense
@@ -25,6 +25,12 @@ install -Dpm0644 %{SOURCE1} %{buildroot}%{_licensedir}/%{name}/LICENSE
 %license %{_licensedir}/%{name}/LICENSE
 
 %changelog
+* Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.38-1
+- Accept --summary and --detailed as global flags before or after subcommands
+- Open the usual CAS main menu for cas --detailed and cas --summary
+- Preserve the requested usage display mode when selected through that menu
+- Keep usage/cost/price aliases, date picker, and exact JSON behavior unchanged
+
 * Thu Oct 08 2026 CAS Project <cas@localhost> - 0.1.37-1
 - Add --summary and --detailed display modes to usage, cost, and price
 - Default to compact K/M/B token counts and compact token averages
